@@ -11,7 +11,9 @@
       "Bash(curl.exe:*)",
       "Bash(npm run dev:*)",
       "Bash(taskkill:*)",
-      "Bash(powershell -Command:*)"
+      "Bash(powershell -Command:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial MVP: Agno + FastAPI + Next.js full-stack agent platform\n\nWorking end-to-end loop: Next.js UI -> FastAPI proxy -> Agno Agent \\(gpt-4o-mini\\) -> Supabase Postgres persistence. Includes thread management, SWR polling, approval gate scaffolding, and mobile-first dark UI.\n\nKey fixes from scaffolding: corrected Agno v1.0.1 import paths \\(PostgresAgentStorage, AgentMemory wrapper\\), URL-encoded DB passwords, extracted getBackendConfig to shared lib, async params for Next.js 16, and persistent message state in ChatStream.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)"
     ]
   }
 }
