@@ -1,0 +1,22 @@
+# Environment secrets
+.env
+agent/.env
+web/.env
+
+# Python
+__pycache__/
+*.pyc
+agent/.venv/
+
+# Node
+web/node_modules/
+web/.next/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/

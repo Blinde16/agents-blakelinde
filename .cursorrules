@@ -1,0 +1,23 @@
+# Blake Linde Agents Platform Context Rules
+
+## Global Constraints
+1. **Never write generic AI conversational code**. This is an operational command center. Do not insert "I'm happy to help!", "Certainly!", or "Here are your steps". Ensure outputs are blunt, data-oriented, and clinical.
+2. **Absolute Imports**. In TypeScript, always use `@/` alias paths mapping to `/web/src/`. In Python, always import from the root module (e.g. `from agent.src.graph...`).
+3. **Architecture Boundaries**. Next.js handles purely UI presentation and Clerk Auth. Python FastAPI handles purely LLM Orchestration, Memory, and Tool Calling. They communicate exclusively via REST HTTP.
+
+## Python (Backend Layer)
+1. Use `pydantic v2` strictly for all tool inputs and outputs.
+2. Every Langchain Tool MUST have `args_schema` explicitly defined.
+3. Every database/external API call must be `async`. Blocking the FastAPI Uvicorn thread is a catastrophic failure.
+4. Supabase interactions must be handled via `asyncpg`, not synchronous wrappers.
+5. Do NOT hardcode System Prompts inside python strings in `.py` files. Load them asynchronously from `/agent/prompts/`.
+
+## TypeScript & React (Frontend Layer)
+1. Component boundaries must be strictly typed.
+2. Use Shadcn UI primitive blocks exclusively. No messy custom un-tail-winded CSS files.
+3. Next.js App Router must be used. Server Actions are strictly forbidden for LangGraph communication—use explicit route handlers in `/app/api/...` to proxy the JWT to Python.
+4. Disable Vercel's caching for the `GET /api/threads/{id}/state` endpoint; it requires real-time accuracy via SWR HTTP polling.
+
+## Data Mappings (Supabase)
+1. All queries mutating data outside of `langgraph_checkpoints` must map to a `user_id` authenticated via the Next.js issued Service JWT.
+2. Ensure you append `_checkpoints` schemas carefully—do not alter official `langgraph-checkpoint-postgres` schema definitions. Use only your custom `users` and `approval_gates` tables.
