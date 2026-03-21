@@ -1,0 +1,12 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "installCommand": "npm install",
+  "regions": ["iad1"],
+  "env": {
+    "BACKEND_API_URL": "@backend-api-url",
+    "INTERNAL_SERVICE_KEY_SIGNER": "@internal-service-key-signer",
+    "SITE_PASSWORD": "@site-password"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "_readme": "Copy the 'mcpServers' block into your Claude desktop config. See path below.",
+  "_config_path_mac": "~/Library/Application Support/Claude/claude_desktop_config.json",
+  "_config_path_windows": "%APPDATA%\\Claude\\claude_desktop_config.json",
+
+  "mcpServers": {
+    "blake-agents": {
+      "command": "python",
+      "args": ["/ABSOLUTE/PATH/TO/agents-blakelinde/agent/mcp_server.py"],
+      "_note": "Replace /ABSOLUTE/PATH/TO/ with the real path on your machine",
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "NOTION_API_KEY": "secret_...",
+        "NOTION_CONTENT_CALENDAR_DB_ID": "your-db-id-here",
+        "NOTION_BRAND_GUIDELINES_DB_ID": "your-db-id-here",
+        "OPENAI_MODEL": "gpt-4o"
+      }
+    }
+  }
+}
