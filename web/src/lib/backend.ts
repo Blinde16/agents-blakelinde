@@ -4,9 +4,10 @@ export const getBackendConfig = () => {
 
     return {
         backendUrl,
+        serviceToken,
         headers: {
             "Content-Type": "application/json",
             "x-service-token": serviceToken,
-        }
+        },
     };
 };

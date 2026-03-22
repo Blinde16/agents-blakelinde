@@ -20,7 +20,7 @@ export const ChatStream = () => {
     const { data, mutate } = useSWR(
         threadId && isProcessing ? `/api/threads/${threadId}/state` : null,
         fetcher,
-        { refreshInterval: 1500 }
+        { refreshInterval: 500 }
     );
 
     // Side effect to sync the SWR DB pull with the global Zustand HUD state
@@ -65,9 +65,12 @@ export const ChatStream = () => {
                     <div 
                         key={i} 
                         className={cn(
-                            "max-w-[85%] rounded-lg p-3 text-[15px] leading-relaxed",
-                            isHuman ? "ml-auto bg-zinc-800 text-zinc-100" : "mr-auto bg-transparent border border-zinc-800/80 text-zinc-300 font-mono text-sm"
+                            "animate-fade-in-up max-w-[85%] rounded-2xl p-4 text-[15px] leading-relaxed shadow-sm",
+                            isHuman 
+                              ? "ml-auto bg-gradient-to-br from-emerald-600 to-emerald-800 text-white shadow-emerald-900/20 rounded-tr-sm" 
+                              : "mr-auto glass-panel text-zinc-200 font-mono text-sm rounded-tl-sm"
                         )}
+                        style={{ animationDelay: `${i * 0.05}s` }}
                     >
                         <p className="whitespace-pre-wrap">{msg.content}</p>
                     </div>

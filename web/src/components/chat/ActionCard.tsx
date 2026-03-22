@@ -28,9 +28,12 @@ export const ActionCard = ({ threadId, onDecisionResolved }: ActionCardProps) =>
     };
 
     return (
-        <div className="my-4 border rounded-lg overflow-hidden border-zinc-800 bg-zinc-950/50 max-w-[85%] mr-auto">
-            <div className="bg-zinc-800/60 px-4 py-2 text-xs text-zinc-300 font-mono tracking-wider border-b border-zinc-800 flex justify-between">
-                <span>SYSTEM &gt; REQUIRED_APPROVAL</span>
+        <div className="my-4 border rounded-2xl overflow-hidden glass-panel max-w-[85%] mr-auto shadow-lg shadow-black/30 animate-fade-in-up">
+            <div className="bg-zinc-900/40 px-5 py-3 text-xs text-zinc-300 font-mono tracking-wider border-b border-zinc-700/50 flex justify-between items-center backdrop-blur-md">
+                <span className="flex items-center gap-2">
+                    <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    SYSTEM &gt; REQUIRED_APPROVAL
+                </span>
             </div>
             <div className="p-4 flex flex-col gap-2">
                 <p className="text-sm text-zinc-200">
@@ -42,8 +45,8 @@ export const ActionCard = ({ threadId, onDecisionResolved }: ActionCardProps) =>
                         disabled={submitting}
                         onClick={() => handleAction("APPROVED")}
                         className={cn(
-                            "flex-1 rounded py-2 px-3 text-sm font-semibold transition-all text-black",
-                            submitting ? "bg-emerald-600/50" : "bg-emerald-500 hover:bg-emerald-400"
+                            "flex-1 rounded-xl py-2.5 px-3 text-sm font-semibold transition-all text-white shadow-md",
+                            submitting ? "bg-emerald-600/50" : "bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 transform hover:scale-[1.02]"
                         )}
                     >
                         {submitting ? "Sending..." : "Approve & Execute"}
@@ -52,8 +55,8 @@ export const ActionCard = ({ threadId, onDecisionResolved }: ActionCardProps) =>
                         disabled={submitting}
                         onClick={() => handleAction("REJECTED")}
                         className={cn(
-                            "rounded py-2 px-4 text-sm font-semibold transition-all",
-                            submitting ? "text-zinc-600 bg-zinc-900" : "text-zinc-300 bg-zinc-800 hover:bg-red-500/20 hover:text-red-400"
+                            "rounded-xl py-2.5 px-5 text-sm font-semibold transition-all",
+                            submitting ? "text-zinc-600 bg-zinc-900" : "text-zinc-300 bg-zinc-800/50 hover:bg-red-500/20 hover:text-red-400 border border-zinc-700/50 transform hover:scale-[1.02]"
                         )}
                     >
                         Reject

@@ -19,6 +19,7 @@ export const Controls = () => {
             setIsProcessing(true);
             try {
                 const res = await fetch("/api/threads", { method: "POST" });
+                if (!res.ok) throw new Error("Thread creation failed");
                 const data = await res.json();
                 activeThreadId = data.thread_id;
                 setThreadId(activeThreadId as string);
@@ -35,11 +36,12 @@ export const Controls = () => {
         setIsProcessing(true); // Engages the UI frontend loader + SWR interval
         
         try {
-            await fetch(`/api/threads/${activeThreadId}/messages`, {
+            const res = await fetch(`/api/threads/${activeThreadId}/messages`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ message: payload })
             });
+            if (!res.ok) throw new Error("Message submission failed");
         } catch (err) {
             console.error(err);
             setIsProcessing(false);
@@ -47,36 +49,38 @@ export const Controls = () => {
     };
 
     return (
-        <div className="w-full bg-black/80 backdrop-blur-md p-4 sticky bottom-0 border-t border-zinc-800">
-            <form onSubmit={handleSubmit} className="flex gap-2 max-w-3xl mx-auto relative">
-                <input
-                    type="text"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    placeholder="Enter operation..."
-                    className="flex-1 rounded-full bg-zinc-900 border border-zinc-800 px-6 py-3 text-sm focus:outline-none focus:ring-1 focus:ring-zinc-600 text-zinc-100 placeholder:text-zinc-600 transition-all"
-                    autoComplete="off"
-                />
-                
-                {/* Text submission */}
-                {input.trim().length > 0 ? (
-                    <button 
-                        type="submit" 
-                        disabled={isProcessing}
-                        className="absolute right-2 top-1.5 p-2 bg-emerald-600 text-white rounded-full hover:bg-emerald-500 transition-colors disabled:opacity-50"
-                    >
-                        <SendHorizontal size={18} />
-                    </button>
-                ) : (
-                    /* The designated Vapi "Push to Talk" hook placeholder matching MOBILE_UX specs */
-                    <button 
-                        type="button" 
-                        className="absolute right-2 top-1.5 p-2 bg-zinc-800 text-zinc-400 rounded-full hover:text-white hover:bg-zinc-700 transition-colors"
-                        onClick={() => alert("Vapi Web SDK Hook Placeholder - Opens Mic Stream")}
-                    >
-                        <Mic size={18} />
-                    </button>
-                )}
+        <div className="w-full bg-transparent p-4 sticky bottom-0 z-20 pb-8">
+            <form onSubmit={handleSubmit} className="flex gap-2 max-w-3xl mx-auto relative relative group animate-fade-in-up">
+                <div className="relative flex-1 flex items-center glass-pill rounded-full transition-all focus-within:ring-1 focus-within:ring-emerald-500/50 focus-within:bg-zinc-900/80 shadow-lg shadow-black/40">
+                    <input
+                        type="text"
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        placeholder="Enter operation..."
+                        className="flex-1 bg-transparent px-6 py-4 text-[15px] focus:outline-none text-zinc-100 placeholder:text-zinc-500 transition-all font-sans"
+                        autoComplete="off"
+                    />
+                    
+                    {/* Text submission */}
+                    {input.trim().length > 0 ? (
+                        <button 
+                            type="submit" 
+                            disabled={isProcessing}
+                            className="absolute right-2 p-2.5 bg-emerald-600 text-white rounded-full flex items-center justify-center hover:bg-emerald-500 transition-all disabled:opacity-50 shadow-md transform hover:scale-105"
+                        >
+                            <SendHorizontal size={18} className="ml-0.5" />
+                        </button>
+                    ) : (
+                        /* The designated Vapi "Push to Talk" hook placeholder matching MOBILE_UX specs */
+                        <button 
+                            type="button" 
+                            className="absolute right-2 p-2.5 bg-transparent text-zinc-400 rounded-full hover:text-emerald-400 hover:bg-zinc-800/80 transition-all flex items-center justify-center"
+                            onClick={() => alert("Vapi Web SDK Hook Placeholder - Opens Mic Stream")}
+                        >
+                            <Mic size={18} />
+                        </button>
+                    )}
+                </div>
             </form>
         </div>
     );
