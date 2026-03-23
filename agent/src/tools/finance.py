@@ -1,32 +1,74 @@
-async def get_client_margin(client_name: str) -> str:
-    """Read-only. Returns exact margins and profitability for a specific client from the database.
-    
-    Args:
-        client_name (str): The exact name of the client to look up.
-    """
-    try:
-        # Placeholder for exact SQL or Supabase hit
-        # Requires AsyncPG execution mapping to tenant_id
-        # e.g., result = await db.fetch("SELECT margin FROM invoices WHERE client=$1", client_name)
-        if "acme" in client_name.lower():
-            return '{"client": "Acme Corp", "margin_percentage": 68.5, "total_revenue_ytd": 45000}'
-        else:
-            return f"Client {client_name} not found in billing database."
-    except Exception as e:
-        return f'{{"error": "Failed to query margin dataset: {str(e)}"}}'
+"""Read-only finance metrics from Postgres (asyncpg)."""
 
-async def get_revenue_summary(timeframe: str) -> str:
-    """Read-only. Returns total revenue aggregated across all clients for a timeframe.
-    
-    Args:
-        timeframe (str): The timeframe to aggregate ('YTD', 'Q1', 'LAST_MONTH').
-    """
-    try:
-        if timeframe.upper() == "YTD":
-            return '{"timeframe": "YTD", "total_revenue": 1250000}'
-        return f'{{"timeframe": "{timeframe}", "total_revenue": 0}}'
-    except Exception as e:
-        return f'{{"error": "Failed to aggregate revenue: {str(e)}"}}'
+from __future__ import annotations
 
-# The CFO Node will bind exactly these tools to its execution.
-cfo_tools = [get_client_margin, get_revenue_summary]
+import json
+from typing import Any
+
+from src.orchestration.db_pool import get_pool
+from src.tools.schemas import ClientMarginInput, RevenueSummaryInput
+
+
+async def get_client_margin(client_name: str, db_url: str) -> str:
+    """Read-only. Returns margin and YTD revenue for a client row in finance_client_metrics."""
+    try:
+        ClientMarginInput(client_name=client_name)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": "validation_error", "detail": str(exc)})
+
+    _ = db_url
+    key = client_name.strip().lower()
+    try:
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT display_name, margin_pct, revenue_ytd
+                FROM public.finance_client_metrics
+                WHERE LOWER(client_key) = $1
+                   OR LOWER(display_name) LIKE $2
+                ORDER BY CASE WHEN LOWER(client_key) = $1 THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                key,
+                f"%{key}%",
+            )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": "database_error", "detail": str(exc)})
+
+    if row is None:
+        return json.dumps({"detail": f"Client {client_name!r} not found in finance_client_metrics."})
+
+    payload: dict[str, Any] = {
+        "client": row["display_name"],
+        "margin_percentage": float(row["margin_pct"]),
+        "total_revenue_ytd": float(row["revenue_ytd"]),
+    }
+    return json.dumps(payload)
+
+
+async def get_revenue_summary(timeframe: str, db_url: str) -> str:
+    """Read-only. Aggregated revenue for a named period from finance_revenue_totals."""
+    try:
+        RevenueSummaryInput(timeframe=timeframe)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": "validation_error", "detail": str(exc)})
+
+    _ = db_url
+    tf = timeframe.strip().upper()
+    try:
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT total_revenue
+                FROM public.finance_revenue_totals
+                WHERE UPPER(timeframe) = $1
+                """,
+                tf,
+            )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": "database_error", "detail": str(exc)})
+
+    if row is None:
+        return json.dumps({"timeframe": tf, "total_revenue": 0, "detail": "Period not found."})
+
+    return json.dumps({"timeframe": tf, "total_revenue": float(row["total_revenue"])})

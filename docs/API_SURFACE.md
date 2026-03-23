@@ -6,7 +6,7 @@ This architecture defines explicit service boundaries to separate the Next.js fr
 **Transport**: Next.js connects via standard HTTP REST. Internal auth checks the `X-Service-Token` header.
 - `POST /api/threads` → Instantiates a new Postgres checkpoint thread ID and returns it.
 - `POST /api/threads/{thread_id}/messages` → Pushes human text input strings into the graph. Returns a `{ status: "processing" }` 202 acknowledgment.
-- `GET /api/threads/{thread_id}/state` → The frontend continuously polls this endpoint every 2s. The endpoint returns current `active_agent`, current chat text, and the payload for any `PENDING` tool approvals.
+- `GET /api/threads/{thread_id}/state` → The frontend continuously polls this endpoint every 2s. The endpoint returns current `active_agent`, persisted chat text, runtime `status`, and the payload for any `PENDING` tool approvals.
 - `POST /api/threads/{thread_id}/approve` → The frontend pushes a body like `{"decision": "APPROVED"}` returning the graph to active processing status. 
 
 ## External Webhooks
