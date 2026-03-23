@@ -17,6 +17,7 @@ web/.next/
 Thumbs.db
 nul
 
-# IDE
+# IDE / local tooling
 .vscode/
 .idea/
+.claude/

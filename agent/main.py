@@ -1,6 +1,15 @@
+import asyncio
+import logging
 import os
+
 from dotenv import load_dotenv
+
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -9,6 +18,8 @@ from agno.storage.agent.postgres import PostgresAgentStorage
 
 # Import the API router — was missing, caused crash on startup
 from src.api.routes import router as api_router
+from src.orchestration.db_pool import close_pool, init_pool
+from src.tools.sync_run import set_main_loop
 from src.orchestration.state import initialize_runtime_tables
 from src.rag.seed_knowledge import ensure_knowledge_seeded
 
@@ -33,6 +44,15 @@ async def lifespan(app: FastAPI):
         print(f"[WARN] Postgres initialization info: {e}")
 
     try:
+        await init_pool(db_uri)
+        print("[OK] asyncpg connection pool ready.")
+    except Exception as e:
+        print(f"[ERROR] asyncpg pool failed: {e}")
+        raise
+
+    set_main_loop(asyncio.get_running_loop())
+
+    try:
         await ensure_knowledge_seeded(db_uri)
     except Exception as e:
         print(f"[WARN] Knowledge seed skipped: {e}")
@@ -42,6 +62,8 @@ async def lifespan(app: FastAPI):
     app.state.agent_storage = agent_storage
     app.state.database_url = db_uri
     yield
+
+    await close_pool()
 
 
 app = FastAPI(title="Blake Linde Agents Platform", lifespan=lifespan)

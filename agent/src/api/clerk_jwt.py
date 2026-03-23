@@ -46,6 +46,8 @@ def decode_clerk_jwt_sub(token: str) -> str:
     try:
         jwks = _get_jwks_client()
         signing_key = jwks.get_signing_key_from_jwt(token)
+        # TODO: set verify_aud True and pass audience= once Clerk JWT template + env are fixed
+        # (e.g. azp or custom aud); leaving aud unchecked accepts any audience for this issuer.
         payload = jwt.decode(
             token,
             signing_key.key,

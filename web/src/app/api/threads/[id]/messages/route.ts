@@ -5,7 +5,13 @@ import { buildAuthHeaders } from "@/lib/backendAuth";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
     const { id: threadId } = await params;
-    const body = await request.json();
+    let body: Record<string, unknown>;
+    try {
+        body = (await request.json()) as Record<string, unknown>;
+    } catch {
+        return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+    const stream = body.stream === true;
     const { backendUrl } = getBackendConfig();
 
     let headers: HeadersInit;
@@ -22,7 +28,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             body: JSON.stringify(body),
         });
 
-        if (!response.ok) throw new Error("Failed to push message");
+        if (!response.ok) {
+            const errText = await response.text();
+            return NextResponse.json(
+                { error: errText || "Failed to push message" },
+                { status: response.status }
+            );
+        }
+
+        if (stream && response.body) {
+            return new Response(response.body, {
+                status: response.status,
+                headers: {
+                    "Content-Type": response.headers.get("Content-Type") || "text/event-stream",
+                    "Cache-Control": "no-store",
+                },
+            });
+        }
 
         const data = await response.json();
         return NextResponse.json(data);

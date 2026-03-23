@@ -6,8 +6,9 @@ import logging
 import os
 from pathlib import Path
 
-import asyncpg
 from openai import AsyncOpenAI
+
+from src.orchestration.db_pool import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +29,13 @@ def _to_vector_literal(vec: list[float]) -> str:
 
 
 async def ensure_knowledge_seeded(db_url: str) -> None:
+    _ = db_url
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY not set; skipping knowledge base seed.")
         return
 
-    conn = await asyncpg.connect(db_url)
-    try:
+    async with get_pool().acquire() as conn:
         try:
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM public.knowledge_chunks WHERE embedding IS NOT NULL"
@@ -44,8 +45,6 @@ async def ensure_knowledge_seeded(db_url: str) -> None:
             return
         if count is not None and int(count) > 0:
             return
-    finally:
-        await conn.close()
 
     kdir = _knowledge_dir()
     if not kdir.is_dir():
@@ -58,8 +57,7 @@ async def ensure_knowledge_seeded(db_url: str) -> None:
         return
 
     client = AsyncOpenAI(api_key=api_key)
-    conn = await asyncpg.connect(db_url)
-    try:
+    async with get_pool().acquire() as conn:
         for path in files:
             text = path.read_text(encoding="utf-8").strip()
             if not text:
@@ -77,5 +75,3 @@ async def ensure_knowledge_seeded(db_url: str) -> None:
                 vec_lit,
             )
             logger.info("embedded knowledge file %s", path.name)
-    finally:
-        await conn.close()

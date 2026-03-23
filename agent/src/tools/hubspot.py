@@ -9,15 +9,20 @@ from typing import Any
 import httpx
 
 from src.tools.schemas import HubSpotReadDealInput, HubSpotUpdateDealStageInput
+from src.tools.sync_run import run_sync_tool
 
 _HUBSPOT_BASE = "https://api.hubapi.com"
 
 
 def _token() -> str | None:
-    return os.getenv("HUBSPOT_PRIVATE_APP_TOKEN") or os.getenv("HUBSPOT_ACCESS_TOKEN")
+    return (
+        os.getenv("HUBSPOT_PRIVATE_APP_TOKEN")
+        or os.getenv("HUBSPOT_ACCESS_TOKEN")
+        or os.getenv("HUBSPOT_API_KEY")
+    )
 
 
-async def hubspot_read_deal(deal_name: str) -> str:
+async def _hubspot_read_deal_async(deal_name: str) -> str:
     """Search HubSpot deals by name fragment; returns stage, amount, and id when token is set."""
     try:
         HubSpotReadDealInput(deal_name=deal_name)
@@ -29,7 +34,7 @@ async def hubspot_read_deal(deal_name: str) -> str:
         return json.dumps(
             {
                 "error": "hubspot_not_configured",
-                "detail": "Set HUBSPOT_PRIVATE_APP_TOKEN to enable live CRM reads.",
+                "detail": "Set HUBSPOT_PRIVATE_APP_TOKEN (or HUBSPOT_ACCESS_TOKEN / HUBSPOT_API_KEY) for live CRM reads.",
             }
         )
 
@@ -85,6 +90,10 @@ async def hubspot_read_deal(deal_name: str) -> str:
     return json.dumps({"deals": out}, indent=2)
 
 
+def hubspot_read_deal(deal_name: str) -> str:
+    return run_sync_tool(_hubspot_read_deal_async(deal_name))
+
+
 async def execute_hubspot_update_deal_stage(deal_id: str, new_stage: str) -> str:
     """PATCH deal stage (runs after human approval). Use HubSpot internal stage ids when required."""
     try:
@@ -95,7 +104,10 @@ async def execute_hubspot_update_deal_stage(deal_id: str, new_stage: str) -> str
     token = _token()
     if not token:
         return json.dumps(
-            {"error": "hubspot_not_configured", "detail": "Set HUBSPOT_PRIVATE_APP_TOKEN."}
+            {
+                "error": "hubspot_not_configured",
+                "detail": "Set HUBSPOT_PRIVATE_APP_TOKEN (or HUBSPOT_ACCESS_TOKEN / HUBSPOT_API_KEY).",
+            }
         )
 
     # HubSpot expects numeric object id for v3 path

@@ -10,18 +10,32 @@ interface ActionCardProps {
 
 export const ActionCard = ({ threadId, onDecisionResolved }: ActionCardProps) => {
     const [submitting, setSubmitting] = useState(false);
+    const [error, setError] = useState<string | null>(null);
 
     const handleAction = async (decision: "APPROVED" | "REJECTED") => {
         setSubmitting(true);
+        setError(null);
         try {
-            await fetch(`/api/threads/${threadId}/approve`, {
+            const res = await fetch(`/api/threads/${threadId}/approve`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ decision }),
             });
+            const data = (await res.json().catch(() => ({}))) as { error?: string; detail?: string };
+            if (!res.ok) {
+                setError(
+                    typeof data.error === "string"
+                        ? data.error
+                        : typeof data.detail === "string"
+                          ? data.detail
+                          : `Request failed (${res.status})`
+                );
+                return;
+            }
             onDecisionResolved();
         } catch (e) {
             console.error(e);
+            setError(e instanceof Error ? e.message : "Network error");
         } finally {
             setSubmitting(false);
         }
@@ -40,6 +54,11 @@ export const ActionCard = ({ threadId, onDecisionResolved }: ActionCardProps) =>
                     The agent is attempting to execute a potentially destructive tool. Please review and authorize.
                 </p>
                 
+                {error && (
+                    <p className="text-xs font-mono text-red-400" role="alert">
+                        {error}
+                    </p>
+                )}
                 <div className="mt-4 flex gap-3">
                     <button 
                         disabled={submitting}

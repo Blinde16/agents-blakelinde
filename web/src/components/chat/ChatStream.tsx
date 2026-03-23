@@ -7,20 +7,30 @@ import { ActionCard } from "./ActionCard";
 import { cn } from "@/lib/utils";
 import { Bot } from "lucide-react";
 
-const fetcher = (url: string) => fetch(url).then(r => r.json());
+type ThreadMessage = { role: string; content: string };
+
+const fetcher = (url: string) =>
+    fetch(url).then((r) => {
+        if (!r.ok) {
+            throw new Error(`State fetch failed: ${r.status}`);
+        }
+        return r.json();
+    });
 
 export const ChatStream = () => {
     const threadId = useChatStore((state) => state.threadId);
+    const streamingBuffer = useChatStore((state) => state.streamingBuffer);
+    const streamingPhase = useChatStore((state) => state.streamingPhase);
     const { isProcessing, setIsProcessing, activeAgent, setActiveAgent } = useChatStore();
     const bottomRef = useRef<HTMLDivElement>(null);
-    const [messages, setMessages] = useState<any[]>([]);
+    const [messages, setMessages] = useState<ThreadMessage[]>([]);
     const [needsApproval, setNeedsApproval] = useState(false);
 
     // Core logic: If we have a thread and it's processing, ping every 1.5s as mandated.
     const { data, mutate } = useSWR(
         threadId && isProcessing ? `/api/threads/${threadId}/state` : null,
         fetcher,
-        { refreshInterval: 500 }
+        { refreshInterval: 1500 }
     );
 
     // Side effect to sync the SWR DB pull with the global Zustand HUD state
@@ -31,9 +41,10 @@ export const ChatStream = () => {
             }
             setNeedsApproval(data.pending_approval || false);
 
-            if (data.status === "completed" && !data.pending_approval) {
-                setIsProcessing(false);
-            }
+            // Do not clear isProcessing here when status is "completed". A poll can return the
+            // *previous* run's completed row before push_message flips the row to "processing",
+            // which would kill the spinner mid-SSE (~1–3s). Processing ends in Controls when the
+            // stream finishes (or on error there).
             if (data.active_agent && data.active_agent !== activeAgent) {
                 setActiveAgent(data.active_agent);
             }
@@ -43,11 +54,16 @@ export const ChatStream = () => {
         }
     }, [data, setIsProcessing, activeAgent, setActiveAgent]);
 
-    // Loading / Transition label abstraction
     const getLoadingLabel = () => {
         if (needsApproval) return "Awaiting human approval...";
-        if (!activeAgent || activeAgent === "OPS") return "Routing request...";
-        return `Querying ${activeAgent} Layer databases...`;
+        if (!activeAgent) return "Routing request...";
+        if (activeAgent.includes("Operations")) {
+            return "Running operations (email, calendar, triage)...";
+        }
+        if (activeAgent.includes("Finance")) return "Running finance tools...";
+        if (activeAgent.includes("Sales")) return "Running CRM / revenue tools...";
+        if (activeAgent.includes("Brand")) return "Running brand and marketing tools...";
+        return `Using ${activeAgent}...`;
     };
 
     return (
@@ -59,7 +75,7 @@ export const ChatStream = () => {
                 </div>
             )}
             
-            {messages.map((msg: any, i: number) => {
+            {messages.map((msg, i: number) => {
                 const isHuman = msg.role === "user";
                 return (
                     <div 
@@ -77,6 +93,12 @@ export const ChatStream = () => {
                 );
             })}
 
+            {streamingBuffer.length > 0 && (
+                <div className="animate-fade-in-up mr-auto max-w-[85%] rounded-2xl rounded-tl-sm p-4 glass-panel text-zinc-200 font-mono text-sm shadow-sm">
+                    <p className="whitespace-pre-wrap">{streamingBuffer}</p>
+                </div>
+            )}
+
             {/* The structural pause injected into the stream visually */}
             {needsApproval && threadId && (
                 <ActionCard 
@@ -86,14 +108,14 @@ export const ChatStream = () => {
             )}
 
             {/* System Status Indicator directly conforming to UX_COPY_GUIDELINES.md */}
-            {isProcessing && !needsApproval && (
+            {isProcessing && !needsApproval && streamingBuffer.length === 0 && (
                 <div className="mr-auto inline-flex items-center gap-3 px-4 py-2 bg-zinc-900/50 rounded-full border border-zinc-800">
                     <span className="flex h-2 w-2">
                         <span className="animate-ping absolute inline-flex h-2 w-2 rounded-full bg-emerald-400 opacity-75"></span>
                         <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                     </span>
                     <span className="text-xs font-mono text-zinc-400 tracking-wide">
-                        {getLoadingLabel()}
+                        {streamingPhase || getLoadingLabel()}
                     </span>
                 </div>
             )}

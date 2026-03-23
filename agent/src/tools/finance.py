@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import asyncpg
-
+from src.orchestration.db_pool import get_pool
 from src.tools.schemas import ClientMarginInput, RevenueSummaryInput
 
 
@@ -17,25 +16,24 @@ async def get_client_margin(client_name: str, db_url: str) -> str:
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": "validation_error", "detail": str(exc)})
 
+    _ = db_url
     key = client_name.strip().lower()
-    conn = await asyncpg.connect(db_url)
     try:
-        row = await conn.fetchrow(
-            """
-            SELECT display_name, margin_pct, revenue_ytd
-            FROM public.finance_client_metrics
-            WHERE LOWER(client_key) = $1
-               OR LOWER(display_name) LIKE $2
-            ORDER BY CASE WHEN LOWER(client_key) = $1 THEN 0 ELSE 1 END
-            LIMIT 1
-            """,
-            key,
-            f"%{key}%",
-        )
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT display_name, margin_pct, revenue_ytd
+                FROM public.finance_client_metrics
+                WHERE LOWER(client_key) = $1
+                   OR LOWER(display_name) LIKE $2
+                ORDER BY CASE WHEN LOWER(client_key) = $1 THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                key,
+                f"%{key}%",
+            )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": "database_error", "detail": str(exc)})
-    finally:
-        await conn.close()
 
     if row is None:
         return json.dumps({"detail": f"Client {client_name!r} not found in finance_client_metrics."})
@@ -55,21 +53,20 @@ async def get_revenue_summary(timeframe: str, db_url: str) -> str:
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": "validation_error", "detail": str(exc)})
 
+    _ = db_url
     tf = timeframe.strip().upper()
-    conn = await asyncpg.connect(db_url)
     try:
-        row = await conn.fetchrow(
-            """
-            SELECT total_revenue
-            FROM public.finance_revenue_totals
-            WHERE UPPER(timeframe) = $1
-            """,
-            tf,
-        )
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT total_revenue
+                FROM public.finance_revenue_totals
+                WHERE UPPER(timeframe) = $1
+                """,
+                tf,
+            )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": "database_error", "detail": str(exc)})
-    finally:
-        await conn.close()
 
     if row is None:
         return json.dumps({"timeframe": tf, "total_revenue": 0, "detail": "Period not found."})

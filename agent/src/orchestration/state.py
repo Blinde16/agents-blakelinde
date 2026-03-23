@@ -3,8 +3,9 @@ import logging
 from typing import Any, Optional
 from uuid import uuid4
 
-import asyncpg
 import psycopg2
+
+from src.orchestration.db_pool import get_pool
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,51 @@ def initialize_runtime_tables(db_url: str) -> None:
     connection.autocommit = True
     try:
         with connection.cursor() as cursor:
+            # Core tables (match supabase/migrations/001_initial_schema.sql) — must exist before FKs.
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.users (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    clerk_user_id TEXT NOT NULL UNIQUE,
+                    tenant_id UUID,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.threads (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
+                    title TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                DO $$ BEGIN
+                    CREATE TYPE approval_status AS ENUM ('PENDING', 'APPROVED', 'REJECTED');
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END $$;
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.approval_gates (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    thread_id UUID REFERENCES public.threads(id) ON DELETE CASCADE,
+                    tool_name TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    status approval_status DEFAULT 'PENDING',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS public.thread_runs (
@@ -81,6 +127,76 @@ def initialize_runtime_tables(db_url: str) -> None:
             )
             cursor.execute(
                 """
+                CREATE TABLE IF NOT EXISTS public.finance_sheet_staging (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    upload_id UUID NOT NULL,
+                    filename TEXT NOT NULL,
+                    row_index INT NOT NULL,
+                    row_payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_finance_staging_user_upload
+                    ON public.finance_sheet_staging (user_id, upload_id);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_finance_staging_upload_row
+                    ON public.finance_sheet_staging (upload_id, row_index);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.user_notion_credentials (
+                    user_id UUID PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+                    token_cipher TEXT NOT NULL,
+                    content_database_id TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.user_google_credentials (
+                    user_id UUID PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+                    refresh_token_cipher TEXT NOT NULL,
+                    google_email TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.social_media_posts (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    platform TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    scheduled_at TIMESTAMPTZ,
+                    published_at TIMESTAMPTZ,
+                    external_post_id TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT social_media_posts_status_check CHECK (
+                        status IN ('draft', 'scheduled', 'published', 'cancelled')
+                    )
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_social_posts_user_status
+                    ON public.social_media_posts (user_id, status);
+                """
+            )
+            cursor.execute(
+                """
                 INSERT INTO public.finance_client_metrics (client_key, display_name, margin_pct, revenue_ytd)
                 VALUES
                     ('acme', 'Acme Corp', 68.5, 45000),
@@ -99,15 +215,11 @@ def initialize_runtime_tables(db_url: str) -> None:
         connection.close()
 
 
-async def _connect(db_url: str) -> asyncpg.Connection:
-    return await asyncpg.connect(db_url)
-
-
 async def get_or_create_user_id(db_url: str, clerk_user_id: str) -> str:
     """Returns internal public.users.id as string for the given Clerk subject."""
-    connection = await _connect(db_url)
-    try:
-        row = await connection.fetchrow(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
             """
             INSERT INTO public.users (clerk_user_id)
             VALUES ($1)
@@ -117,35 +229,15 @@ async def get_or_create_user_id(db_url: str, clerk_user_id: str) -> str:
             """,
             clerk_user_id,
         )
-    finally:
-        await connection.close()
     if row is None:
         raise RuntimeError("failed to resolve user")
     return row[0]
 
 
-async def assert_thread_owned(db_url: str, thread_id: str, user_internal_id: str) -> None:
-    connection = await _connect(db_url)
-    try:
-        row = await connection.fetchrow(
-            """
-            SELECT 1 AS ok
-            FROM public.threads
-            WHERE id = $1::uuid AND user_id = $2::uuid
-            """,
-            thread_id,
-            user_internal_id,
-        )
-    finally:
-        await connection.close()
-    if row is None:
-        raise ThreadAccessError("Thread not found or access denied")
-
-
 async def create_thread_state(db_url: str, thread_id: str, user_internal_id: str) -> None:
-    connection = await _connect(db_url)
-    try:
-        await connection.execute(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        await conn.execute(
             """
             INSERT INTO public.threads (id, user_id)
             VALUES ($1::uuid, $2::uuid)
@@ -154,7 +246,7 @@ async def create_thread_state(db_url: str, thread_id: str, user_internal_id: str
             thread_id,
             user_internal_id,
         )
-        await connection.execute(
+        await conn.execute(
             """
             INSERT INTO public.thread_runs (thread_id, status, updated_at)
             VALUES ($1::uuid, 'idle', NOW())
@@ -163,8 +255,6 @@ async def create_thread_state(db_url: str, thread_id: str, user_internal_id: str
             """,
             thread_id,
         )
-    finally:
-        await connection.close()
 
 
 async def append_message(
@@ -174,21 +264,26 @@ async def append_message(
     role: str,
     content: str,
 ) -> None:
-    await assert_thread_owned(db_url, thread_id, user_internal_id)
-    connection = await _connect(db_url)
-    try:
-        await connection.execute(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
             """
             INSERT INTO public.thread_messages (id, thread_id, role, content)
-            VALUES ($1::uuid, $2::uuid, $3, $4)
+            SELECT $1::uuid, $2::uuid, $3, $4
+            WHERE EXISTS (
+                SELECT 1 FROM public.threads
+                WHERE id = $2::uuid AND user_id = $5::uuid
+            )
+            RETURNING id
             """,
             str(uuid4()),
             thread_id,
             role,
             content,
+            user_internal_id,
         )
-    finally:
-        await connection.close()
+    if row is None:
+        raise ThreadAccessError("Thread not found or access denied")
 
 
 async def set_run_state(
@@ -202,10 +297,19 @@ async def set_run_state(
     approval_gate_id: Optional[str] = None,
     last_error: Optional[str] = None,
 ) -> None:
-    await assert_thread_owned(db_url, thread_id, user_internal_id)
-    connection = await _connect(db_url)
-    try:
-        await connection.execute(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        own = await conn.fetchrow(
+            """
+            SELECT 1 AS ok FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if own is None:
+            raise ThreadAccessError("Thread not found or access denied")
+        await conn.execute(
             """
             INSERT INTO public.thread_runs (
                 thread_id,
@@ -241,8 +345,6 @@ async def set_run_state(
             approval_gate_id,
             last_error,
         )
-    finally:
-        await connection.close()
 
 
 async def create_approval_gate(
@@ -252,11 +354,20 @@ async def create_approval_gate(
     tool_name: str,
     payload: dict[str, Any],
 ) -> str:
-    await assert_thread_owned(db_url, thread_id, user_internal_id)
+    _ = db_url
     gate_id = str(uuid4())
-    connection = await _connect(db_url)
-    try:
-        await connection.execute(
+    async with get_pool().acquire() as conn:
+        own = await conn.fetchrow(
+            """
+            SELECT 1 AS ok FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if own is None:
+            raise ThreadAccessError("Thread not found or access denied")
+        await conn.execute(
             """
             INSERT INTO public.approval_gates (id, thread_id, tool_name, payload, status)
             VALUES ($1::uuid, $2::uuid, $3, $4::jsonb, 'PENDING')
@@ -266,15 +377,13 @@ async def create_approval_gate(
             tool_name,
             json.dumps(payload),
         )
-    finally:
-        await connection.close()
     return gate_id
 
 
 async def get_pending_approval(db_url: str, thread_id: str) -> Optional[dict[str, Any]]:
-    connection = await _connect(db_url)
-    try:
-        row = await connection.fetchrow(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
             """
             SELECT id, tool_name, payload, status, created_at
             FROM public.approval_gates
@@ -284,8 +393,6 @@ async def get_pending_approval(db_url: str, thread_id: str) -> Optional[dict[str
             """,
             thread_id,
         )
-    finally:
-        await connection.close()
 
     if row is None:
         return None
@@ -304,14 +411,37 @@ async def resolve_pending_approval(
     user_internal_id: str,
     decision: str,
 ) -> Optional[dict[str, Any]]:
-    await assert_thread_owned(db_url, thread_id, user_internal_id)
-    pending = await get_pending_approval(db_url, thread_id)
-    if pending is None:
-        return None
-
-    connection = await _connect(db_url)
-    try:
-        await connection.execute(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        own = await conn.fetchrow(
+            """
+            SELECT 1 AS ok FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if own is None:
+            raise ThreadAccessError("Thread not found or access denied")
+        prow = await conn.fetchrow(
+            """
+            SELECT id, tool_name, payload, status, created_at
+            FROM public.approval_gates
+            WHERE thread_id = $1::uuid AND status = 'PENDING'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            thread_id,
+        )
+        if prow is None:
+            return None
+        pending = {
+            "id": str(prow["id"]),
+            "tool_name": prow["tool_name"],
+            "payload": prow["payload"],
+            "status": prow["status"],
+        }
+        await conn.execute(
             """
             UPDATE public.approval_gates
             SET status = $2::approval_status, updated_at = NOW()
@@ -320,11 +450,29 @@ async def resolve_pending_approval(
             pending["id"],
             decision,
         )
-    finally:
-        await connection.close()
 
     pending["status"] = decision
     return pending
+
+
+async def get_recent_messages(
+    thread_id: str,
+    limit: int = 6,
+) -> list[dict[str, str]]:
+    """Return the most recent *limit* messages for a thread (oldest-first)."""
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT role, content
+            FROM public.thread_messages
+            WHERE thread_id = $1::uuid
+            ORDER BY created_at DESC, id DESC
+            LIMIT $2
+            """,
+            thread_id,
+            limit,
+        )
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
 async def get_thread_state(
@@ -332,10 +480,21 @@ async def get_thread_state(
     thread_id: str,
     user_internal_id: str,
 ) -> dict[str, Any]:
-    await assert_thread_owned(db_url, thread_id, user_internal_id)
-    connection = await _connect(db_url)
-    try:
-        run_row = await connection.fetchrow(
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        owner = await conn.fetchrow(
+            """
+            SELECT 1 AS ok
+            FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if owner is None:
+            raise ThreadAccessError("Thread not found or access denied")
+
+        run_row = await conn.fetchrow(
             """
             SELECT status, active_agent, pending_approval, approval_gate_id, last_error
             FROM public.thread_runs
@@ -343,7 +502,7 @@ async def get_thread_state(
             """,
             thread_id,
         )
-        message_rows = await connection.fetch(
+        message_rows = await conn.fetch(
             """
             SELECT role, content
             FROM public.thread_messages
@@ -352,14 +511,40 @@ async def get_thread_state(
             """,
             thread_id,
         )
-    finally:
-        await connection.close()
+
+        approval_request = None
+        if run_row is not None and bool(run_row["pending_approval"]):
+            prow = await conn.fetchrow(
+                """
+                SELECT id, tool_name, payload, status, created_at
+                FROM public.approval_gates
+                WHERE thread_id = $1::uuid AND status = 'PENDING'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                thread_id,
+            )
+            if prow is not None:
+                approval_request = {
+                    "id": str(prow["id"]),
+                    "tool_name": prow["tool_name"],
+                    "payload": prow["payload"],
+                    "status": prow["status"],
+                }
+
+    messages = [{"role": row["role"], "content": row["content"]} for row in message_rows]
 
     if run_row is None:
-        return {"status": "idle", "messages": [], "pending_approval": False}
+        return {
+            "status": "idle",
+            "active_agent": None,
+            "messages": messages,
+            "pending_approval": False,
+            "approval_request": None,
+            "last_error": None,
+        }
 
     pending_approval = bool(run_row["pending_approval"])
-    approval_request = await get_pending_approval(db_url, thread_id) if pending_approval else None
 
     return {
         "status": run_row["status"],
@@ -367,5 +552,5 @@ async def get_thread_state(
         "pending_approval": pending_approval,
         "approval_request": approval_request,
         "last_error": run_row["last_error"],
-        "messages": [{"role": row["role"], "content": row["content"]} for row in message_rows],
+        "messages": messages,
     }

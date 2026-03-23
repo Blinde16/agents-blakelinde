@@ -15,17 +15,19 @@ def _build_agent(
     role: str,
     description: str,
     prompt_name: str,
+    instructions: Optional[str] = None,
     storage=None,
     memory_db=None,
     tool_context: Optional[ToolRuntimeContext] = None,
 ) -> Agent:
     tools_by_role = build_tools_by_role(tool_context)
+    prompt_text = instructions if instructions is not None else load_prompt(prompt_name)
     return Agent(
         name=name,
         role=role,
         model=OpenAIChat(id=os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
         description=description,
-        instructions=load_prompt(prompt_name),
+        instructions=prompt_text,
         tools=tools_by_role.get(role, []),
         storage=storage,
         memory=AgentMemory(db=memory_db) if memory_db else None,
@@ -33,6 +35,7 @@ def _build_agent(
         num_history_responses=10,
         tool_call_limit=25,
         show_tool_calls=True,
+        stream_intermediate_steps=True,
     )
 
 
@@ -117,5 +120,6 @@ def build_ops_agent(
         storage=storage,
         memory_db=memory_db,
         prompt_name="ops.md",
+        instructions=load_prompt("ops.md") + "\n\n---\n\n" + load_prompt("email_assistant.md"),
         tool_context=tool_context,
     )

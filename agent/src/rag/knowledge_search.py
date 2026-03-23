@@ -6,8 +6,9 @@ import json
 import os
 from typing import Any
 
-import asyncpg
 from openai import AsyncOpenAI
+
+from src.orchestration.db_pool import get_pool
 
 _EMBED_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
@@ -22,6 +23,7 @@ def _to_vector_literal(vec: list[float]) -> str:
 
 
 async def search_brand_knowledge(db_url: str, query: str, *, limit: int = 5) -> str:
+    _ = db_url
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return json.dumps(
@@ -32,20 +34,20 @@ async def search_brand_knowledge(db_url: str, query: str, *, limit: int = 5) -> 
     qvec = await _embed(client, query)
     vec_lit = _to_vector_literal(qvec)
 
-    conn = await asyncpg.connect(db_url)
     try:
-        rows = await conn.fetch(
-            """
-            SELECT source, content, metadata,
-                   (embedding <=> $1::vector) AS dist
-            FROM public.knowledge_chunks
-            WHERE embedding IS NOT NULL
-            ORDER BY embedding <=> $1::vector
-            LIMIT $2
-            """,
-            vec_lit,
-            limit,
-        )
+        async with get_pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT source, content, metadata,
+                       (embedding <=> $1::vector) AS dist
+                FROM public.knowledge_chunks
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> $1::vector
+                LIMIT $2
+                """,
+                vec_lit,
+                limit,
+            )
     except Exception as exc:  # noqa: BLE001
         return json.dumps(
             {
@@ -54,8 +56,6 @@ async def search_brand_knowledge(db_url: str, query: str, *, limit: int = 5) -> 
                 "hint": "Ensure pgvector extension and knowledge_chunks table exist.",
             }
         )
-    finally:
-        await conn.close()
 
     if not rows:
         return json.dumps({"results": [], "detail": "No embedded documents in knowledge base."})

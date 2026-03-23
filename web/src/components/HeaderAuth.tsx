@@ -11,7 +11,7 @@ export function HeaderAuth() {
 
   if (!isSignedIn) {
     return (
-      <SignInButton mode="modal">
+      <SignInButton mode="redirect" forceRedirectUrl="/">
         <button
           type="button"
           className="px-2.5 py-1 bg-zinc-900/80 rounded border border-zinc-800/80 text-zinc-300 hover:text-white"

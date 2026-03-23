@@ -19,9 +19,21 @@ export async function POST() {
             headers,
         });
 
-        if (!response.ok) throw new Error("Backend creation failed");
+        const text = await response.text();
+        if (!response.ok) {
+            let detail: unknown = text;
+            try {
+                detail = JSON.parse(text);
+            } catch {
+                /* keep raw text */
+            }
+            return NextResponse.json(
+                { error: "Backend thread creation failed", status: response.status, detail },
+                { status: response.status >= 500 ? 502 : response.status },
+            );
+        }
 
-        const data = await response.json();
+        const data = JSON.parse(text);
         return NextResponse.json(data);
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Unknown error";
