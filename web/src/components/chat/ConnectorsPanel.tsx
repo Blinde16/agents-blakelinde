@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import { useUser } from "@clerk/nextjs";
 import useSWR from "swr";
 import { CheckCircle2, ExternalLink, Link2, PlugZap, ShieldAlert } from "lucide-react";
 
@@ -26,12 +27,21 @@ const fetcher = (url: string) =>
     });
 
 export function ConnectorsPanel() {
-    const { data, error, mutate, isLoading } = useSWR<ConnectorStatusResponse>("/api/integrations/status", fetcher, {
-        refreshInterval: 30000,
-        revalidateOnFocus: true,
-    });
+    const { isLoaded, isSignedIn } = useUser();
+    const shouldFetch = isLoaded && isSignedIn;
+    const { data, error, mutate, isLoading } = useSWR<ConnectorStatusResponse>(
+        shouldFetch ? "/api/integrations/status" : null,
+        fetcher,
+        {
+            refreshInterval: 30000,
+            revalidateOnFocus: true,
+        }
+    );
 
     const connectors = data?.connectors ?? [];
+    const authPending = !isLoaded;
+    const signedOut = isLoaded && !isSignedIn;
+    const hasUnauthorizedError = error instanceof Error && error.message.includes("401");
 
     return (
         <section className="border-b border-zinc-900/80 bg-black/30 px-4 py-3 backdrop-blur">
@@ -46,20 +56,39 @@ export function ConnectorsPanel() {
                     <button
                         type="button"
                         onClick={() => void mutate()}
+                        disabled={!shouldFetch}
                         className="rounded-full border border-zinc-800 px-3 py-1 text-[11px] font-mono text-zinc-400 transition hover:border-zinc-700 hover:text-zinc-200"
                     >
                         Refresh
                     </button>
                 </div>
 
-                {error && (
+                {authPending && (
+                    <div className="rounded-2xl border border-zinc-800 bg-zinc-950/50 px-4 py-3 text-sm text-zinc-500">
+                        Loading your session before checking connectors...
+                    </div>
+                )}
+
+                {signedOut && (
+                    <div className="rounded-2xl border border-zinc-800 bg-zinc-950/50 px-4 py-3 text-sm text-zinc-500">
+                        Sign in to load available connectors for this workspace.
+                    </div>
+                )}
+
+                {hasUnauthorizedError && (
+                    <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+                        Your session is still syncing. Refresh once if connectors do not appear in a moment.
+                    </div>
+                )}
+
+                {error && !hasUnauthorizedError && (
                     <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
                         Failed to load connector status.
                     </div>
                 )}
 
                 <div className="grid gap-3 md:grid-cols-2">
-                    {isLoading && connectors.length === 0 && (
+                    {shouldFetch && isLoading && connectors.length === 0 && (
                         <div className="rounded-2xl border border-zinc-800 bg-zinc-950/50 px-4 py-4 text-sm text-zinc-500">
                             Loading connectors...
                         </div>
