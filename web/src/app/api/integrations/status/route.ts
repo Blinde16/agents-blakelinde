@@ -9,8 +9,16 @@ export async function GET() {
     let headers: HeadersInit;
     try {
         headers = await buildAuthHeaders();
-    } catch {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : "Unauthorized";
+        return NextResponse.json(
+            {
+                connectors: [],
+                auth_ready: false,
+                error: message,
+            },
+            { status: 200 }
+        );
     }
 
     try {
@@ -20,11 +28,26 @@ export async function GET() {
         });
         const text = await response.text();
         if (!response.ok) {
-            return NextResponse.json({ error: text || "Failed to load connectors" }, { status: response.status });
+            return NextResponse.json(
+                {
+                    connectors: [],
+                    auth_ready: true,
+                    error: text || "Failed to load connectors",
+                },
+                { status: 200 }
+            );
         }
-        return NextResponse.json(JSON.parse(text) as Record<string, unknown>);
+        const payload = JSON.parse(text) as Record<string, unknown>;
+        return NextResponse.json({ auth_ready: true, ...payload });
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Unknown error";
-        return NextResponse.json({ error: message }, { status: 500 });
+        return NextResponse.json(
+            {
+                connectors: [],
+                auth_ready: true,
+                error: message,
+            },
+            { status: 200 }
+        );
     }
 }

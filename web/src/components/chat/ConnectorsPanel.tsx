@@ -18,6 +18,8 @@ type Connector = {
 
 type ConnectorStatusResponse = {
     connectors?: Connector[];
+    auth_ready?: boolean;
+    error?: string;
 };
 
 const fetcher = (url: string) =>
@@ -39,9 +41,9 @@ export function ConnectorsPanel() {
     );
 
     const connectors = data?.connectors ?? [];
-    const authPending = !isLoaded;
+    const authPending = !isLoaded || (shouldFetch && data?.auth_ready === false);
     const signedOut = isLoaded && !isSignedIn;
-    const hasUnauthorizedError = error instanceof Error && error.message.includes("401");
+    const hasStatusError = Boolean(data?.error) || Boolean(error);
 
     return (
         <section className="border-b border-zinc-900/80 bg-black/30 px-4 py-3 backdrop-blur">
@@ -75,15 +77,15 @@ export function ConnectorsPanel() {
                     </div>
                 )}
 
-                {hasUnauthorizedError && (
+                {data?.auth_ready === false && (
                     <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
                         Your session is still syncing. Refresh once if connectors do not appear in a moment.
                     </div>
                 )}
 
-                {error && !hasUnauthorizedError && (
+                {hasStatusError && data?.auth_ready !== false && (
                     <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-                        Failed to load connector status.
+                        {data?.error || "Failed to load connector status."}
                     </div>
                 )}
 
