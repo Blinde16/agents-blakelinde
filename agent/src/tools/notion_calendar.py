@@ -125,6 +125,32 @@ async def upsert_user_notion_credentials(
         )
 
 
+async def get_notion_connection_status(user_internal_id: str) -> dict[str, Any]:
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT content_database_id, updated_at
+            FROM public.user_notion_credentials
+            WHERE user_id = $1::uuid
+            """,
+            user_internal_id,
+        )
+
+    env_token = bool((os.getenv("NOTION_API_KEY") or os.getenv("NOTION_INTEGRATION_TOKEN") or "").strip())
+    env_db = bool((os.getenv("NOTION_CONTENT_CALENDAR_DB_ID") or "").strip())
+    connected = row is not None or env_token
+    return {
+        "id": "notion",
+        "label": "Notion",
+        "available": True,
+        "connected": connected,
+        "account_label": ("Content calendar configured" if (row and row["content_database_id"]) or env_db else None),
+        "configured_via_env": bool(env_token and row is None),
+        "updated_at": (row["updated_at"].isoformat() if row and row["updated_at"] else None),
+        "capabilities": ["content_calendar"],
+    }
+
+
 async def _list_upcoming_calendar_entries_impl(
     user_internal_id: str,
     limit: int = 20,

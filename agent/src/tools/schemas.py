@@ -151,6 +151,11 @@ class GoogleCredentialsPayload(BaseModel):
     google_email: str | None = Field(None, max_length=320)
 
 
+class GoogleOAuthExchangePayload(BaseModel):
+    code: str = Field(..., min_length=8, max_length=4096)
+    redirect_uri: str = Field(..., min_length=8, max_length=2048)
+
+
 _SOCIAL_PLATFORMS = ("linkedin", "x", "meta", "instagram")
 
 
@@ -189,5 +194,4 @@ class SocialScheduleInput(BaseModel):
 
 class SocialPostIdInput(BaseModel):
     post_id: UUID = Field(..., description="social_media_posts.id")
-
 

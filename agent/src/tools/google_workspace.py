@@ -23,6 +23,7 @@ from src.tools.schemas import (
     GetCalendarEventsInput,
     GoogleMessageIdInput,
     GoogleModifyLabelsInput,
+    GoogleOAuthExchangePayload,
     GoogleSearchEmailInput,
     GoogleThreadIdInput,
     ListRecentThreadsInput,
@@ -89,6 +90,91 @@ async def upsert_user_google_credentials(
             cipher,
             google_email,
         )
+
+
+async def get_google_connection_status(user_internal_id: str) -> dict[str, Any]:
+    cid, secret = _oauth_client()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT google_email, updated_at
+            FROM public.user_google_credentials
+            WHERE user_id = $1::uuid
+            """,
+            user_internal_id,
+        )
+
+    env_refresh = bool((os.getenv("GOOGLE_REFRESH_TOKEN") or "").strip())
+    connected = row is not None or env_refresh
+    return {
+        "id": "google",
+        "label": "Google Workspace",
+        "available": bool(cid and secret),
+        "connected": connected,
+        "account_label": (row["google_email"] if row and row["google_email"] else None),
+        "configured_via_env": bool(env_refresh and row is None),
+        "updated_at": (row["updated_at"].isoformat() if row and row["updated_at"] else None),
+        "capabilities": ["gmail", "calendar"],
+    }
+
+
+async def exchange_google_oauth_code(
+    user_internal_id: str,
+    *,
+    code: str,
+    redirect_uri: str,
+) -> dict[str, Any]:
+    parsed = GoogleOAuthExchangePayload(code=code, redirect_uri=redirect_uri)
+    cid, secret = _oauth_client()
+    if not cid or not secret:
+        raise RuntimeError("GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET is not configured.")
+
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": cid,
+                "client_secret": secret,
+                "code": parsed.code,
+                "grant_type": "authorization_code",
+                "redirect_uri": parsed.redirect_uri,
+            },
+        )
+
+    if token_resp.status_code >= 400:
+        raise RuntimeError(
+            f"Google token exchange failed ({token_resp.status_code}): {(token_resp.text or '')[:500]}"
+        )
+
+    token_data = token_resp.json()
+    refresh_token = token_data.get("refresh_token")
+    access_token = token_data.get("access_token")
+    if not refresh_token:
+        raise RuntimeError(
+            "Google did not return a refresh token. Remove the app from your Google account and reconnect, "
+            "or ensure the OAuth request uses offline access and consent."
+        )
+    if not access_token:
+        raise RuntimeError("Google token exchange returned no access token.")
+
+    google_email: str | None = None
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        profile_resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers=_auth_header(access_token),
+        )
+    if profile_resp.status_code < 400:
+        profile = profile_resp.json()
+        email = profile.get("email")
+        if isinstance(email, str) and email.strip():
+            google_email = email.strip()
+
+    await upsert_user_google_credentials(user_internal_id, refresh_token, google_email)
+    status = await get_google_connection_status(user_internal_id)
+    return {
+        "status": "connected",
+        "connector": status,
+    }
 
 
 async def _access_token(user_internal_id: str) -> Optional[str]:

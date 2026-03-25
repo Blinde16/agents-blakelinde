@@ -31,9 +31,10 @@ from src.orchestration.state import (
 )
 from src.tools.finance_staging import ingest_user_spreadsheet
 from src.tools.google_workspace import upsert_user_google_credentials
-from src.tools.notion_calendar import upsert_user_notion_credentials
+from src.tools.google_workspace import exchange_google_oauth_code, get_google_connection_status
+from src.tools.notion_calendar import get_notion_connection_status, upsert_user_notion_credentials
 from src.tools.registry import execute_mutating_tool
-from src.tools.schemas import GoogleCredentialsPayload, NotionCredentialsPayload
+from src.tools.schemas import GoogleCredentialsPayload, GoogleOAuthExchangePayload, NotionCredentialsPayload
 
 try:
     from agno.run.response import RunEvent
@@ -679,6 +680,36 @@ async def save_google_credentials(
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "saved"}
+
+
+@router.get("/integrations/status")
+async def integration_status(
+    request: Request,
+    clerk_sub: str = Depends(authenticate_internal),
+):
+    db_url = request.app.state.database_url
+    user_internal_id = await get_or_create_user_id(db_url, clerk_sub)
+    google = await get_google_connection_status(user_internal_id)
+    notion = await get_notion_connection_status(user_internal_id)
+    return {"connectors": [google, notion]}
+
+
+@router.post("/integrations/google/oauth/exchange")
+async def exchange_google_oauth(
+    request: Request,
+    payload: GoogleOAuthExchangePayload,
+    clerk_sub: str = Depends(authenticate_internal),
+):
+    db_url = request.app.state.database_url
+    user_internal_id = await get_or_create_user_id(db_url, clerk_sub)
+    try:
+        return await exchange_google_oauth_code(
+            user_internal_id,
+            code=payload.code,
+            redirect_uri=payload.redirect_uri,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/threads/{thread_id}/state")

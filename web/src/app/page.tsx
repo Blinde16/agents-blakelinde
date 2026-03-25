@@ -1,4 +1,5 @@
 import { ChatStream } from "@/components/chat/ChatStream";
+import { ConnectorsPanel } from "@/components/chat/ConnectorsPanel";
 import { Controls } from "@/components/chat/Controls";
 import { Sidebar } from "@/components/chat/Sidebar";
 
@@ -9,6 +10,8 @@ export default function Home() {
             <Sidebar />
             
             <div className="flex flex-col flex-1 relative h-full">
+                <ConnectorsPanel />
+
                 {/* The primary conversation stream */}
                 <ChatStream />
                 
