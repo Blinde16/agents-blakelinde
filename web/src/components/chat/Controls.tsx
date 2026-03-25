@@ -8,6 +8,7 @@ import { consumeChatSse } from "@/lib/sseChat";
 
 export const Controls = () => {
     const [input, setInput] = useState("");
+    const [bootstrapError, setBootstrapError] = useState<string | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const {
         threadId,
@@ -20,6 +21,7 @@ export const Controls = () => {
         setActiveAgent,
         lastSheetUploadId,
         setLastSheetUploadId,
+        resetSession,
     } = useChatStore();
 
     const handleSheetUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -53,17 +55,33 @@ export const Controls = () => {
         // Cold start - bootstrap the backend thread first
         if (!activeThreadId) {
             setIsProcessing(true);
+            setBootstrapError(null);
             try {
-                const res = await fetch("/api/threads", { method: "POST" });
+                const res = await fetch("/api/threads", {
+                    method: "POST",
+                    credentials: "include",
+                });
                 const data = await res.json().catch(() => ({}));
                 if (!res.ok) {
+                    const detail =
+                        typeof (data as { detail?: unknown }).detail === "string"
+                            ? (data as { detail: string }).detail
+                            : JSON.stringify(data);
                     console.error("Thread create failed", res.status, data);
+                    setBootstrapError(
+                        res.status === 401
+                            ? "Sign in required (session missing or expired)."
+                            : res.status === 502
+                              ? "Python backend unreachable from Next.js (check BACKEND_API_URL and that the agent is running)."
+                              : `Thread create failed (${res.status}): ${detail}`,
+                    );
                     setIsProcessing(false);
                     return;
                 }
                 const newId = (data as { thread_id?: string }).thread_id;
                 if (!newId) {
                     console.error("Thread create: missing thread_id", data);
+                    setBootstrapError("Thread create returned no thread_id.");
                     setIsProcessing(false);
                     return;
                 }
@@ -71,6 +89,13 @@ export const Controls = () => {
                 setThreadId(newId);
             } catch (err) {
                 console.error("Failed to boot thread context.", err);
+                const isNetwork =
+                    err instanceof TypeError && String(err.message).includes("fetch");
+                setBootstrapError(
+                    isNetwork
+                        ? "Network error talking to Next.js or the request was blocked. If you use Clerk middleware, ensure /api routes are public in middleware (see web/src/middleware.ts)."
+                        : String(err),
+                );
                 setIsProcessing(false);
                 return;
             }
@@ -87,6 +112,7 @@ export const Controls = () => {
             const res = await fetch(`/api/threads/${activeThreadId}/messages`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
+                credentials: "include",
                 body: JSON.stringify({ message: payload, stream: true }),
             });
             if (!res.ok) {
@@ -123,6 +149,30 @@ export const Controls = () => {
 
     return (
         <div className="w-full bg-transparent p-4 sticky bottom-0 z-20 pb-8">
+            <div className="max-w-3xl mx-auto mb-2 flex flex-wrap items-center gap-2 px-1">
+                {threadId && (
+                    <span className="rounded-full border border-zinc-800 bg-zinc-950/70 px-3 py-1 text-[11px] font-mono text-zinc-400">
+                        Active thread: {threadId.slice(0, 8)}…
+                    </span>
+                )}
+                {lastSheetUploadId && (
+                    <span className="rounded-full border border-emerald-900/60 bg-emerald-950/30 px-3 py-1 text-[11px] font-mono text-emerald-300">
+                        Sheet staged: {lastSheetUploadId.slice(0, 8)}…
+                    </span>
+                )}
+                {(threadId || lastSheetUploadId) && (
+                    <button
+                        type="button"
+                        onClick={() => {
+                            resetSession();
+                            setBootstrapError(null);
+                        }}
+                        className="rounded-full border border-zinc-800 px-3 py-1 text-[11px] font-mono text-zinc-500 transition hover:border-zinc-700 hover:text-zinc-300"
+                    >
+                        Reset Session
+                    </button>
+                )}
+            </div>
             <form onSubmit={handleSubmit} className="flex gap-2 max-w-3xl mx-auto relative group animate-fade-in-up items-center">
                 <input
                     ref={fileInputRef}
@@ -145,7 +195,7 @@ export const Controls = () => {
                         type="text"
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
-                        placeholder="Enter operation..."
+                        placeholder="Ask for work, approvals, finance checks, inbox triage..."
                         className="flex-1 bg-transparent px-6 py-4 text-[15px] focus:outline-none text-zinc-100 placeholder:text-zinc-500 transition-all font-sans"
                         autoComplete="off"
                     />
@@ -171,6 +221,11 @@ export const Controls = () => {
                     )}
                 </div>
             </form>
+            {bootstrapError && (
+                <p className="max-w-3xl mx-auto mt-2 px-1 text-xs text-red-400" role="alert">
+                    {bootstrapError}
+                </p>
+            )}
             {lastSheetUploadId && (
                 <p className="max-w-3xl mx-auto mt-2 px-1 text-[11px] font-mono text-zinc-500 truncate">
                     Staging upload_id: {lastSheetUploadId}

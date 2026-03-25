@@ -1,5 +1,7 @@
 import json
 import logging
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -9,9 +11,90 @@ from src.orchestration.db_pool import get_pool
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_STALE_RUN_SECONDS = 8 * 60
+
 
 class ThreadAccessError(Exception):
     """Raised when a thread is missing or not owned by the authenticated user."""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _stale_run_threshold_seconds() -> int:
+    raw = os.getenv("THREAD_RUN_STALE_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_STALE_RUN_SECONDS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning("Invalid THREAD_RUN_STALE_SECONDS=%r; using default %s", raw, DEFAULT_STALE_RUN_SECONDS)
+        return DEFAULT_STALE_RUN_SECONDS
+    return max(parsed, 30)
+
+
+def derive_run_state(
+    run_row: Any,
+    *,
+    approval_request: Optional[dict[str, Any]],
+    messages: list[dict[str, str]],
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    if run_row is None:
+        return {
+            "status": "idle",
+            "active_agent": None,
+            "messages": messages,
+            "pending_approval": False,
+            "approval_request": None,
+            "last_error": None,
+            "stale": False,
+            "status_detail": None,
+            "updated_at": None,
+            "started_at": None,
+            "completed_at": None,
+        }
+
+    status = run_row["status"]
+    pending_approval = bool(run_row["pending_approval"])
+    last_error = run_row["last_error"]
+    updated_at = run_row["updated_at"]
+    started_at = run_row["started_at"]
+    completed_at = run_row["completed_at"]
+    threshold_seconds = _stale_run_threshold_seconds()
+    stale = False
+    status_detail = None
+
+    if (
+        status == "processing"
+        and not pending_approval
+        and updated_at is not None
+    ):
+        reference_now = now or _utcnow()
+        if reference_now - updated_at >= timedelta(seconds=threshold_seconds):
+            stale = True
+            status = "error"
+            status_detail = (
+                f"Run stalled after {threshold_seconds} seconds without a state update. "
+                "The agent may have crashed or an external tool may be hanging."
+            )
+            if not last_error:
+                last_error = status_detail
+
+    return {
+        "status": status,
+        "active_agent": run_row["active_agent"],
+        "pending_approval": pending_approval,
+        "approval_request": approval_request,
+        "last_error": last_error,
+        "messages": messages,
+        "stale": stale,
+        "status_detail": status_detail,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "started_at": started_at.isoformat() if started_at else None,
+        "completed_at": completed_at.isoformat() if completed_at else None,
+    }
 
 
 def initialize_runtime_tables(db_url: str) -> None:
@@ -73,8 +156,22 @@ def initialize_runtime_tables(db_url: str) -> None:
                     pending_approval BOOLEAN NOT NULL DEFAULT FALSE,
                     approval_gate_id UUID,
                     last_error TEXT,
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE public.thread_runs
+                ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+                """
+            )
+            cursor.execute(
+                """
+                ALTER TABLE public.thread_runs
+                ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
                 """
             )
             cursor.execute(
@@ -84,6 +181,28 @@ def initialize_runtime_tables(db_url: str) -> None:
                     thread_id UUID NOT NULL REFERENCES public.threads(id) ON DELETE CASCADE,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.thread_context_state (
+                    thread_id UUID PRIMARY KEY REFERENCES public.threads(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.action_audit_history (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    thread_id UUID NOT NULL REFERENCES public.threads(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    action_name TEXT NOT NULL,
+                    payload JSONB NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
@@ -248,10 +367,10 @@ async def create_thread_state(db_url: str, thread_id: str, user_internal_id: str
         )
         await conn.execute(
             """
-            INSERT INTO public.thread_runs (thread_id, status, updated_at)
-            VALUES ($1::uuid, 'idle', NOW())
+            INSERT INTO public.thread_runs (thread_id, status, started_at, completed_at, updated_at)
+            VALUES ($1::uuid, 'idle', NULL, NULL, NOW())
             ON CONFLICT (thread_id)
-            DO UPDATE SET status = 'idle', updated_at = NOW()
+            DO UPDATE SET status = 'idle', started_at = NULL, completed_at = NULL, updated_at = NOW()
             """,
             thread_id,
         )
@@ -318,6 +437,8 @@ async def set_run_state(
                 pending_approval,
                 approval_gate_id,
                 last_error,
+                started_at,
+                completed_at,
                 updated_at
             )
             VALUES (
@@ -327,6 +448,8 @@ async def set_run_state(
                 COALESCE($4, FALSE),
                 $5::uuid,
                 $6,
+                CASE WHEN $2 = 'processing' THEN NOW() ELSE NULL END,
+                CASE WHEN $2 IN ('completed', 'error') THEN NOW() ELSE NULL END,
                 NOW()
             )
             ON CONFLICT (thread_id)
@@ -336,6 +459,16 @@ async def set_run_state(
                 pending_approval = COALESCE($4, public.thread_runs.pending_approval),
                 approval_gate_id = $5::uuid,
                 last_error = $6,
+                started_at = CASE
+                    WHEN EXCLUDED.status = 'processing' THEN NOW()
+                    WHEN EXCLUDED.status = 'idle' THEN NULL
+                    ELSE public.thread_runs.started_at
+                END,
+                completed_at = CASE
+                    WHEN EXCLUDED.status IN ('completed', 'error') THEN NOW()
+                    WHEN EXCLUDED.status IN ('processing', 'awaiting_approval', 'idle') THEN NULL
+                    ELSE public.thread_runs.completed_at
+                END,
                 updated_at = NOW()
             """,
             thread_id,
@@ -475,6 +608,92 @@ async def get_recent_messages(
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+async def get_thread_context_state(
+    db_url: str,
+    thread_id: str,
+    user_internal_id: str,
+) -> dict[str, Any]:
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        owner = await conn.fetchrow(
+            """
+            SELECT 1 AS ok
+            FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if owner is None:
+            raise ThreadAccessError("Thread not found or access denied")
+
+        row = await conn.fetchrow(
+            """
+            SELECT context_json
+            FROM public.thread_context_state
+            WHERE thread_id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+    if row is None:
+        return {}
+    payload = row["context_json"] or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def upsert_thread_context_state(
+    db_url: str,
+    thread_id: str,
+    user_internal_id: str,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    _ = db_url
+    if not patch:
+        return await get_thread_context_state(db_url, thread_id, user_internal_id)
+
+    current = await get_thread_context_state(db_url, thread_id, user_internal_id)
+    merged = {**current, **patch}
+
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO public.thread_context_state (thread_id, user_id, context_json, updated_at)
+            VALUES ($1::uuid, $2::uuid, $3::jsonb, NOW())
+            ON CONFLICT (thread_id)
+            DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                context_json = EXCLUDED.context_json,
+                updated_at = NOW()
+            """,
+            thread_id,
+            user_internal_id,
+            json.dumps(merged),
+        )
+    return merged
+
+
+async def append_action_audit(
+    db_url: str,
+    thread_id: str,
+    user_internal_id: str,
+    action_name: str,
+    payload: dict[str, Any],
+) -> None:
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO public.action_audit_history (thread_id, user_id, action_name, payload)
+            VALUES ($1::uuid, $2::uuid, $3, $4::jsonb)
+            """,
+            thread_id,
+            user_internal_id,
+            action_name,
+            json.dumps(payload),
+        )
+
+
 async def get_thread_state(
     db_url: str,
     thread_id: str,
@@ -496,7 +715,7 @@ async def get_thread_state(
 
         run_row = await conn.fetchrow(
             """
-            SELECT status, active_agent, pending_approval, approval_gate_id, last_error
+            SELECT status, active_agent, pending_approval, approval_gate_id, last_error, updated_at, started_at, completed_at
             FROM public.thread_runs
             WHERE thread_id = $1::uuid
             """,
@@ -533,24 +752,4 @@ async def get_thread_state(
                 }
 
     messages = [{"role": row["role"], "content": row["content"]} for row in message_rows]
-
-    if run_row is None:
-        return {
-            "status": "idle",
-            "active_agent": None,
-            "messages": messages,
-            "pending_approval": False,
-            "approval_request": None,
-            "last_error": None,
-        }
-
-    pending_approval = bool(run_row["pending_approval"])
-
-    return {
-        "status": run_row["status"],
-        "active_agent": run_row["active_agent"],
-        "pending_approval": pending_approval,
-        "approval_request": approval_request,
-        "last_error": run_row["last_error"],
-        "messages": messages,
-    }
+    return derive_run_state(run_row, approval_request=approval_request, messages=messages)

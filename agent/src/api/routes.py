@@ -12,17 +12,22 @@ logger = logging.getLogger(__name__)
 
 from src.agents.builder import build_specialist_agent
 from src.api.dependencies import authenticate_internal
+from src.orchestration.action_executor import execute_direct_action
+from src.orchestration.context_engine import prepare_user_intent
 from src.orchestration.router import RouteDecision, route_message
 from src.orchestration.state import (
     ThreadAccessError,
+    append_action_audit,
     append_message,
     create_thread_state,
+    get_thread_context_state,
     get_or_create_user_id,
     get_pending_approval,
     get_recent_messages,
     get_thread_state,
     resolve_pending_approval,
     set_run_state,
+    upsert_thread_context_state,
 )
 from src.tools.finance_staging import ingest_user_spreadsheet
 from src.tools.google_workspace import upsert_user_google_credentials
@@ -46,6 +51,27 @@ def _norm_run_event(ev: object | None) -> str:
     return str(ev)
 
 
+def _log_run_event(
+    event: str,
+    *,
+    thread_id: str,
+    user_internal_id: str,
+    route: RouteDecision | None = None,
+    extra: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "event": event,
+        "thread_id": thread_id,
+        "user_internal_id": user_internal_id,
+    }
+    if route is not None:
+        payload["route_target"] = route.target
+        payload["active_agent"] = route.active_agent
+    if extra:
+        payload.update(extra)
+    logger.info("thread_run %s", json.dumps(payload, ensure_ascii=False, default=str))
+
+
 class MessagePayload(BaseModel):
     message: str
     stream: bool = False
@@ -65,6 +91,84 @@ class ApprovalPayload(BaseModel):
         if d not in ("APPROVED", "REJECTED"):
             raise ValueError('decision must be "APPROVED" or "REJECTED"')
         return d
+
+
+def _route_from_domain(domain: str, message: str) -> RouteDecision:
+    target = domain if domain in ("CFO", "CRO", "CMO", "OPS") else "OPS"
+    active = {
+        "CFO": "Finance_Layer",
+        "CRO": "Sales_Ops_Layer",
+        "CMO": "Brand_Layer",
+        "OPS": "Operations_Layer",
+    }[target]
+    return RouteDecision(
+        target=target,  # type: ignore[arg-type]
+        confidence_score=0.95,
+        reasoning=f"Context resolver pinned domain to {target}.",
+        normalized_message=message,
+        active_agent=active,
+    )
+
+
+async def _stream_direct_action(
+    *,
+    db_url: str,
+    thread_id: str,
+    user_internal_id: str,
+    action_name: str,
+    message_ids: list[str],
+):
+    yield _sse_data_line({"type": "status", "text": "Executing direct email action..."})
+    assistant_text, report = await execute_direct_action(
+        action_name=action_name,
+        message_ids=message_ids,
+        user_internal_id=user_internal_id,
+    )
+    await append_message(db_url, thread_id, user_internal_id, "assistant", assistant_text)
+    await append_action_audit(db_url, thread_id, user_internal_id, action_name, report)
+    await upsert_thread_context_state(
+        db_url,
+        thread_id,
+        user_internal_id,
+        {
+            "selected_email_message_ids": message_ids,
+            "last_direct_action": action_name,
+            "last_direct_action_report": report,
+        },
+    )
+    await set_run_state(
+        db_url,
+        thread_id,
+        user_internal_id,
+        status="completed",
+        active_agent="Operations_Layer",
+        pending_approval=False,
+        approval_gate_id=None,
+        last_error=None,
+    )
+    _log_run_event(
+        "direct_action_started",
+        thread_id=thread_id,
+        user_internal_id=user_internal_id,
+        extra={"action_name": action_name, "message_count": len(message_ids)},
+    )
+    yield _sse_data_line({"type": "delta", "text": assistant_text})
+    yield _sse_data_line(
+        {
+            "type": "done",
+            "thread_id": thread_id,
+            "active_agent": "Operations_Layer",
+            "status": "completed",
+            "pending_approval": False,
+            "approval_gate_id": None,
+        }
+    )
+    _log_run_event(
+        "direct_action_completed",
+        thread_id=thread_id,
+        user_internal_id=user_internal_id,
+        extra={"action_name": action_name, "success_count": report.get("success_count")},
+    )
 
 
 async def async_run_agent(
@@ -91,6 +195,7 @@ async def async_run_agent(
         approval_gate_id=None,
         last_error=None,
     )
+    _log_run_event("agent_run_started", thread_id=thread_id, user_internal_id=user_internal_id, route=route)
 
     try:
         agent = build_specialist_agent(
@@ -122,6 +227,16 @@ async def async_run_agent(
             approval_gate_id=approval_request["id"] if approval_request else None,
             last_error=None,
         )
+        _log_run_event(
+            "agent_run_completed",
+            thread_id=thread_id,
+            user_internal_id=user_internal_id,
+            route=route,
+            extra={
+                "status": ("awaiting_approval" if approval_request else "completed"),
+                "approval_gate_id": (approval_request["id"] if approval_request else None),
+            },
+        )
     except Exception as exc:
         logger.exception("Agent run error for thread %s", thread_id)
         await append_message(db_url, thread_id, user_internal_id, "assistant", f"Agent error: {str(exc)}")
@@ -134,6 +249,13 @@ async def async_run_agent(
             approval_gate_id=None,
             last_error=str(exc),
         )
+        _log_run_event(
+            "agent_run_failed",
+            thread_id=thread_id,
+            user_internal_id=user_internal_id,
+            route=route,
+            extra={"error": str(exc)},
+        )
 
 
 async def async_run_agent_stream(
@@ -141,14 +263,16 @@ async def async_run_agent_stream(
     thread_id: str,
     message: str,
     user_internal_id: str,
+    route: RouteDecision | None = None,
 ):
     """Runs the specialist with Agno streaming; emits SSE `data:` JSON lines.
 
     Emits a status line before intent classification so the client is not idle while the LLM router runs.
     """
     yield _sse_data_line({"type": "status", "text": "Classifying intent…"})
-    history = await get_recent_messages(thread_id, limit=6)
-    route = await route_message(message, history=history)
+    if route is None:
+        history = await get_recent_messages(thread_id, limit=6)
+        route = await route_message(message, history=history)
     yield _sse_data_line(
         {
             "type": "status",
@@ -172,6 +296,7 @@ async def async_run_agent_stream(
         approval_gate_id=None,
         last_error=None,
     )
+    _log_run_event("agent_stream_started", thread_id=thread_id, user_internal_id=user_internal_id, route=route)
 
     try:
         logger.info(
@@ -280,6 +405,17 @@ async def async_run_agent_stream(
             approval_gate_id=approval_request["id"] if approval_request else None,
             last_error=None,
         )
+        _log_run_event(
+            "agent_stream_completed",
+            thread_id=thread_id,
+            user_internal_id=user_internal_id,
+            route=route,
+            extra={
+                "status": ("awaiting_approval" if approval_request else "completed"),
+                "approval_gate_id": (approval_request["id"] if approval_request else None),
+                "reply_chars": len(full_text),
+            },
+        )
         yield _sse_data_line(
             {
                 "type": "done",
@@ -301,6 +437,13 @@ async def async_run_agent_stream(
             pending_approval=False,
             approval_gate_id=None,
             last_error=str(exc),
+        )
+        _log_run_event(
+            "agent_stream_failed",
+            thread_id=thread_id,
+            user_internal_id=user_internal_id,
+            route=route,
+            extra={"error": str(exc)},
         )
         yield _sse_data_line({"type": "error", "message": str(exc)})
 
@@ -334,6 +477,29 @@ async def push_message(
     db_url = request.app.state.database_url
     user_internal_id = await get_or_create_user_id(db_url, clerk_sub)
 
+    history = await get_recent_messages(thread_id, limit=12)
+    try:
+        prior_context = await get_thread_context_state(db_url, thread_id, user_internal_id)
+    except ThreadAccessError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    intent_decision = prepare_user_intent(
+        payload.message,
+        prior_context=prior_context,
+        history=history,
+    )
+    if intent_decision.context_patch:
+        await upsert_thread_context_state(
+            db_url,
+            thread_id,
+            user_internal_id,
+            intent_decision.context_patch,
+        )
+
+    resolved_message = intent_decision.resolved_message
+    route_override: RouteDecision | None = None
+    if intent_decision.domain in ("CFO", "CRO", "CMO", "OPS") and intent_decision.intent != "unknown":
+        route_override = _route_from_domain(intent_decision.domain, resolved_message)
+
     if payload.stream:
         try:
             await append_message(db_url, thread_id, user_internal_id, "user", payload.message)
@@ -349,8 +515,31 @@ async def push_message(
             )
         except ThreadAccessError:
             raise HTTPException(status_code=403, detail="Forbidden") from None
+
+        if intent_decision.direct_action and intent_decision.message_ids:
+            return StreamingResponse(
+                _stream_direct_action(
+                    db_url=db_url,
+                    thread_id=thread_id,
+                    user_internal_id=user_internal_id,
+                    action_name=intent_decision.direct_action,
+                    message_ids=intent_decision.message_ids,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
         return StreamingResponse(
-            async_run_agent_stream(request, thread_id, payload.message, user_internal_id),
+            async_run_agent_stream(
+                request,
+                thread_id,
+                resolved_message,
+                user_internal_id,
+                route_override,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-store",
@@ -358,28 +547,74 @@ async def push_message(
             },
         )
 
-    route = await route_message(payload.message)
-
     try:
         await append_message(db_url, thread_id, user_internal_id, "user", payload.message)
+    except ThreadAccessError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+
+    if intent_decision.direct_action and intent_decision.message_ids:
         await set_run_state(
             db_url,
             thread_id,
             user_internal_id,
             status="processing",
-            active_agent=route.active_agent,
+            active_agent="Operations_Layer",
             pending_approval=False,
             approval_gate_id=None,
             last_error=None,
         )
-    except ThreadAccessError:
-        raise HTTPException(status_code=403, detail="Forbidden") from None
+        assistant_text, report = await execute_direct_action(
+            action_name=intent_decision.direct_action,
+            message_ids=intent_decision.message_ids,
+            user_internal_id=user_internal_id,
+        )
+        await append_message(db_url, thread_id, user_internal_id, "assistant", assistant_text)
+        await append_action_audit(
+            db_url,
+            thread_id,
+            user_internal_id,
+            intent_decision.direct_action,
+            report,
+        )
+        await upsert_thread_context_state(
+            db_url,
+            thread_id,
+            user_internal_id,
+            {
+                "selected_email_message_ids": intent_decision.message_ids,
+                "last_direct_action": intent_decision.direct_action,
+                "last_direct_action_report": report,
+            },
+        )
+        await set_run_state(
+            db_url,
+            thread_id,
+            user_internal_id,
+            status="completed",
+            active_agent="Operations_Layer",
+            pending_approval=False,
+            approval_gate_id=None,
+            last_error=None,
+        )
+        return {"status": "completed", "thread_id": thread_id, "active_agent": "Operations_Layer"}
+
+    route = route_override or await route_message(resolved_message, history=history)
+    await set_run_state(
+        db_url,
+        thread_id,
+        user_internal_id,
+        status="processing",
+        active_agent=route.active_agent,
+        pending_approval=False,
+        approval_gate_id=None,
+        last_error=None,
+    )
 
     background_tasks.add_task(
         async_run_agent,
         request,
         thread_id,
-        payload.message,
+        resolved_message,
         user_internal_id,
         route,
     )
@@ -456,7 +691,16 @@ async def get_state(
     db_url = request.app.state.database_url
     user_internal_id = await get_or_create_user_id(db_url, clerk_sub)
     try:
-        return await get_thread_state(db_url, thread_id, user_internal_id)
+        payload = await get_thread_state(db_url, thread_id, user_internal_id)
+        if payload.get("stale"):
+            logger.warning(
+                "thread_run_stale thread=%s user=%s active=%s updated_at=%s",
+                thread_id,
+                user_internal_id,
+                payload.get("active_agent"),
+                payload.get("updated_at"),
+            )
+        return payload
     except ThreadAccessError:
         raise HTTPException(status_code=403, detail="Forbidden") from None
 
@@ -500,6 +744,12 @@ async def approve_tool(
                 approval_gate_id=None,
                 last_error=None,
             )
+            _log_run_event(
+                "approval_rejected",
+                thread_id=thread_id,
+                user_internal_id=user_internal_id,
+                extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"]},
+            )
         except ThreadAccessError:
             raise HTTPException(status_code=403, detail="Forbidden") from None
         return {"status": "rejected"}
@@ -514,6 +764,12 @@ async def approve_tool(
             approval_gate_id=None,
             last_error=None,
         )
+        _log_run_event(
+            "approval_resumed",
+            thread_id=thread_id,
+            user_internal_id=user_internal_id,
+            extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"]},
+        )
     except ThreadAccessError:
         raise HTTPException(status_code=403, detail="Forbidden") from None
 
@@ -521,6 +777,13 @@ async def approve_tool(
         try:
             result = await execute_mutating_tool(approval["tool_name"], approval["payload"])
             await append_message(db_url, thread_id, user_internal_id, "assistant", result)
+            await append_action_audit(
+                db_url,
+                thread_id,
+                user_internal_id,
+                approval["tool_name"],
+                {"result": result, "payload": approval["payload"]},
+            )
             await set_run_state(
                 db_url,
                 thread_id,
@@ -529,6 +792,12 @@ async def approve_tool(
                 pending_approval=False,
                 approval_gate_id=None,
                 last_error=None,
+            )
+            _log_run_event(
+                "approved_action_completed",
+                thread_id=thread_id,
+                user_internal_id=user_internal_id,
+                extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"]},
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("finalize_approved_action failed thread=%s", thread_id)
@@ -548,6 +817,12 @@ async def approve_tool(
                     pending_approval=False,
                     approval_gate_id=None,
                     last_error=str(exc),
+                )
+                _log_run_event(
+                    "approved_action_failed",
+                    thread_id=thread_id,
+                    user_internal_id=user_internal_id,
+                    extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"], "error": str(exc)},
                 )
             except ThreadAccessError:
                 logger.warning("finalize_approved_action could not persist error for thread=%s", thread_id)
