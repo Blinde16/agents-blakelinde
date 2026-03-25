@@ -411,6 +411,26 @@ async def _unstar_email_impl(user_internal_id: str, message_id: str) -> str:
     return await _modify_message_impl(user_internal_id, parsed.message_id, [], ["STARRED"])
 
 
+async def execute_archive_email(user_internal_id: str, message_id: str) -> str:
+    return await _archive_email_impl(user_internal_id, message_id)
+
+
+async def execute_mark_email_read(user_internal_id: str, message_id: str) -> str:
+    return await _mark_email_read_impl(user_internal_id, message_id)
+
+
+async def execute_mark_email_unread(user_internal_id: str, message_id: str) -> str:
+    return await _mark_email_unread_impl(user_internal_id, message_id)
+
+
+async def execute_star_email(user_internal_id: str, message_id: str) -> str:
+    return await _star_email_impl(user_internal_id, message_id)
+
+
+async def execute_unstar_email(user_internal_id: str, message_id: str) -> str:
+    return await _unstar_email_impl(user_internal_id, message_id)
+
+
 # --- Approval: trash, arbitrary label changes ---
 
 

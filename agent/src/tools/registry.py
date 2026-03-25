@@ -36,8 +36,12 @@ class ToolRuntimeContext:
     user_internal_id: str
 
 
-async def get_current_time() -> str:
-    """Read-only utility. Returns current system time in UTC."""
+def get_current_time() -> str:
+    """Read-only utility. Returns current system time in UTC.
+
+    Must be synchronous: Agno executes tools in a sync path; ``async def`` tools
+    leak a coroutine into message content (see sync_run.py).
+    """
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 
