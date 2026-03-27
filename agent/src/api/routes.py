@@ -3,7 +3,7 @@ import logging
 import uuid
 from enum import Enum
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from pydantic import BaseModel, field_validator
@@ -14,12 +14,14 @@ from src.agents.builder import build_specialist_agent
 from src.api.dependencies import authenticate_internal
 from src.orchestration.action_executor import execute_direct_action
 from src.orchestration.context_engine import prepare_user_intent
+from src.orchestration.job_runner import execute_agent_run_job
 from src.orchestration.router import RouteDecision, route_message
 from src.orchestration.state import (
     ThreadAccessError,
     append_action_audit,
     append_message,
     create_thread_state,
+    enqueue_agent_job,
     get_thread_context_state,
     get_or_create_user_id,
     get_pending_approval,
@@ -33,7 +35,6 @@ from src.tools.finance_staging import ingest_user_spreadsheet
 from src.tools.google_workspace import upsert_user_google_credentials
 from src.tools.google_workspace import exchange_google_oauth_code, get_google_connection_status
 from src.tools.notion_calendar import get_notion_connection_status, upsert_user_notion_credentials
-from src.tools.registry import execute_mutating_tool
 from src.tools.schemas import GoogleCredentialsPayload, GoogleOAuthExchangePayload, NotionCredentialsPayload
 
 try:
@@ -185,78 +186,15 @@ async def async_run_agent(
     if route is None:
         history = await get_recent_messages(thread_id, limit=6)
         route = await route_message(message, history=history)
-
-    await set_run_state(
-        db_url,
-        thread_id,
-        user_internal_id,
-        status="processing",
-        active_agent=route.active_agent,
-        pending_approval=False,
-        approval_gate_id=None,
-        last_error=None,
+    await execute_agent_run_job(
+        db_url=db_url,
+        agent_storage=agent_storage,
+        agent_memory=agent_memory,
+        thread_id=thread_id,
+        message=route.normalized_message,
+        user_internal_id=user_internal_id,
+        route=route,
     )
-    _log_run_event("agent_run_started", thread_id=thread_id, user_internal_id=user_internal_id, route=route)
-
-    try:
-        agent = build_specialist_agent(
-            route.target,
-            thread_id=thread_id,
-            db_url=db_url,
-            user_internal_id=user_internal_id,
-            storage=agent_storage,
-            memory_db=agent_memory,
-        )
-        response = await agent.arun(route.normalized_message, session_id=thread_id)
-
-        agent_text = ""
-        if hasattr(response, "content"):
-            agent_text = response.content or ""
-        elif isinstance(response, str):
-            agent_text = response
-
-        await append_message(db_url, thread_id, user_internal_id, "assistant", agent_text)
-        approval_request = await get_pending_approval(db_url, thread_id)
-
-        await set_run_state(
-            db_url,
-            thread_id,
-            user_internal_id,
-            status="awaiting_approval" if approval_request else "completed",
-            active_agent=route.active_agent,
-            pending_approval=bool(approval_request),
-            approval_gate_id=approval_request["id"] if approval_request else None,
-            last_error=None,
-        )
-        _log_run_event(
-            "agent_run_completed",
-            thread_id=thread_id,
-            user_internal_id=user_internal_id,
-            route=route,
-            extra={
-                "status": ("awaiting_approval" if approval_request else "completed"),
-                "approval_gate_id": (approval_request["id"] if approval_request else None),
-            },
-        )
-    except Exception as exc:
-        logger.exception("Agent run error for thread %s", thread_id)
-        await append_message(db_url, thread_id, user_internal_id, "assistant", f"Agent error: {str(exc)}")
-        await set_run_state(
-            db_url,
-            thread_id,
-            user_internal_id,
-            status="error",
-            pending_approval=False,
-            approval_gate_id=None,
-            last_error=str(exc),
-        )
-        _log_run_event(
-            "agent_run_failed",
-            thread_id=thread_id,
-            user_internal_id=user_internal_id,
-            route=route,
-            extra={"error": str(exc)},
-        )
 
 
 async def async_run_agent_stream(
@@ -471,10 +409,9 @@ async def push_message(
     thread_id: str,
     payload: MessagePayload,
     request: Request,
-    background_tasks: BackgroundTasks,
     clerk_sub: str = Depends(authenticate_internal),
 ):
-    """Accepts a user message and fires agent execution as a background task."""
+    """Accepts a user message and enqueues durable execution when not streaming."""
     db_url = request.app.state.database_url
     user_internal_id = await get_or_create_user_id(db_url, clerk_sub)
 
@@ -611,15 +548,26 @@ async def push_message(
         last_error=None,
     )
 
-    background_tasks.add_task(
-        async_run_agent,
-        request,
+    job_id = await enqueue_agent_job(
+        db_url,
         thread_id,
-        resolved_message,
         user_internal_id,
-        route,
+        job_type="agent_run",
+        payload={"message": resolved_message, "route": route.model_dump()},
     )
-    return {"status": "processing", "thread_id": thread_id, "active_agent": route.active_agent}
+    _log_run_event(
+        "agent_run_enqueued",
+        thread_id=thread_id,
+        user_internal_id=user_internal_id,
+        route=route,
+        extra={"job_id": job_id},
+    )
+    return {
+        "status": "processing",
+        "thread_id": thread_id,
+        "active_agent": route.active_agent,
+        "job_id": job_id,
+    }
 
 
 @router.post("/finance/sheets/upload")
@@ -741,7 +689,6 @@ async def approve_tool(
     thread_id: str,
     payload: ApprovalPayload,
     request: Request,
-    background_tasks: BackgroundTasks,
     clerk_sub: str = Depends(authenticate_internal),
 ):
     """Executes or rejects a pending approval-gated tool call."""
@@ -795,68 +742,21 @@ async def approve_tool(
             approval_gate_id=None,
             last_error=None,
         )
-        _log_run_event(
-            "approval_resumed",
-            thread_id=thread_id,
-            user_internal_id=user_internal_id,
-            extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"]},
-        )
     except ThreadAccessError:
         raise HTTPException(status_code=403, detail="Forbidden") from None
 
-    async def finalize_approved_action():
-        try:
-            result = await execute_mutating_tool(approval["tool_name"], approval["payload"])
-            await append_message(db_url, thread_id, user_internal_id, "assistant", result)
-            await append_action_audit(
-                db_url,
-                thread_id,
-                user_internal_id,
-                approval["tool_name"],
-                {"result": result, "payload": approval["payload"]},
-            )
-            await set_run_state(
-                db_url,
-                thread_id,
-                user_internal_id,
-                status="completed",
-                pending_approval=False,
-                approval_gate_id=None,
-                last_error=None,
-            )
-            _log_run_event(
-                "approved_action_completed",
-                thread_id=thread_id,
-                user_internal_id=user_internal_id,
-                extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"]},
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("finalize_approved_action failed thread=%s", thread_id)
-            try:
-                await append_message(
-                    db_url,
-                    thread_id,
-                    user_internal_id,
-                    "assistant",
-                    f"Approved action failed: {exc}",
-                )
-                await set_run_state(
-                    db_url,
-                    thread_id,
-                    user_internal_id,
-                    status="error",
-                    pending_approval=False,
-                    approval_gate_id=None,
-                    last_error=str(exc),
-                )
-                _log_run_event(
-                    "approved_action_failed",
-                    thread_id=thread_id,
-                    user_internal_id=user_internal_id,
-                    extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"], "error": str(exc)},
-                )
-            except ThreadAccessError:
-                logger.warning("finalize_approved_action could not persist error for thread=%s", thread_id)
-
-    background_tasks.add_task(finalize_approved_action)
-    return {"status": "resumed"}
+    job_id = await enqueue_agent_job(
+        db_url,
+        thread_id,
+        user_internal_id,
+        job_type="approved_tool",
+        payload={"approval": approval},
+        priority=50,
+    )
+    _log_run_event(
+        "approved_action_enqueued",
+        thread_id=thread_id,
+        user_internal_id=user_internal_id,
+        extra={"tool_name": approval["tool_name"], "approval_gate_id": approval["id"], "job_id": job_id},
+    )
+    return {"status": "processing", "job_id": job_id}

@@ -9,8 +9,9 @@ export async function POST() {
     let headers: HeadersInit;
     try {
         headers = await buildAuthHeaders();
-    } catch {
-        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : "Unauthorized";
+        return NextResponse.json({ error: "Unauthorized", detail: message }, { status: 401 });
     }
 
     try {

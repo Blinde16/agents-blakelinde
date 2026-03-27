@@ -21,6 +21,7 @@ from src.api.routes import router as api_router
 from src.orchestration.db_pool import close_pool, init_pool
 from src.tools.sync_run import set_main_loop
 from src.orchestration.state import initialize_runtime_tables
+from src.orchestration.worker import run_job_worker
 from src.rag.seed_knowledge import ensure_knowledge_seeded
 
 
@@ -61,8 +62,18 @@ async def lifespan(app: FastAPI):
     app.state.agent_memory = agent_memory
     app.state.agent_storage = agent_storage
     app.state.database_url = db_uri
+    worker_stop = asyncio.Event()
+    worker_task = asyncio.create_task(run_job_worker(app, worker_stop), name="agent-job-worker")
+    app.state.agent_job_worker_stop = worker_stop
+    app.state.agent_job_worker_task = worker_task
     yield
 
+    worker_stop.set()
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
     await close_pool()
 
 
