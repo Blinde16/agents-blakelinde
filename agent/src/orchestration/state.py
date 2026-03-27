@@ -12,10 +12,16 @@ from src.orchestration.db_pool import get_pool
 logger = logging.getLogger(__name__)
 
 DEFAULT_STALE_RUN_SECONDS = 8 * 60
+DEFAULT_JOB_RETRY_DELAY_SECONDS = 30
+DEFAULT_JOB_STALE_SECONDS = 5 * 60
 
 
 class ThreadAccessError(Exception):
     """Raised when a thread is missing or not owned by the authenticated user."""
+
+
+class AgentJobNotFoundError(Exception):
+    """Raised when a durable agent job is missing."""
 
 
 def _utcnow() -> datetime:
@@ -31,6 +37,38 @@ def _stale_run_threshold_seconds() -> int:
     except ValueError:
         logger.warning("Invalid THREAD_RUN_STALE_SECONDS=%r; using default %s", raw, DEFAULT_STALE_RUN_SECONDS)
         return DEFAULT_STALE_RUN_SECONDS
+    return max(parsed, 30)
+
+
+def _job_retry_delay_seconds() -> int:
+    raw = os.getenv("AGENT_JOB_RETRY_DELAY_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_JOB_RETRY_DELAY_SECONDS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid AGENT_JOB_RETRY_DELAY_SECONDS=%r; using default %s",
+            raw,
+            DEFAULT_JOB_RETRY_DELAY_SECONDS,
+        )
+        return DEFAULT_JOB_RETRY_DELAY_SECONDS
+    return max(parsed, 5)
+
+
+def _job_stale_threshold_seconds() -> int:
+    raw = os.getenv("AGENT_JOB_STALE_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_JOB_STALE_SECONDS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid AGENT_JOB_STALE_SECONDS=%r; using default %s",
+            raw,
+            DEFAULT_JOB_STALE_SECONDS,
+        )
+        return DEFAULT_JOB_STALE_SECONDS
     return max(parsed, 30)
 
 
@@ -205,6 +243,44 @@ def initialize_runtime_tables(db_url: str) -> None:
                     payload JSONB NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS public.agent_jobs (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    thread_id UUID NOT NULL REFERENCES public.threads(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                    job_type TEXT NOT NULL,
+                    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    priority INT NOT NULL DEFAULT 100,
+                    attempts INT NOT NULL DEFAULT 0,
+                    max_attempts INT NOT NULL DEFAULT 3,
+                    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    worker_id TEXT,
+                    heartbeat_at TIMESTAMPTZ,
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT agent_jobs_status_check CHECK (
+                        status IN ('queued', 'running', 'completed', 'failed')
+                    )
+                );
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_jobs_status_available
+                    ON public.agent_jobs (status, available_at, priority, created_at);
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_agent_jobs_thread_created
+                    ON public.agent_jobs (thread_id, created_at DESC);
                 """
             )
             try:
@@ -692,6 +768,278 @@ async def append_action_audit(
             action_name,
             json.dumps(payload),
         )
+
+
+async def enqueue_agent_job(
+    db_url: str,
+    thread_id: str,
+    user_internal_id: str,
+    *,
+    job_type: str,
+    payload: dict[str, Any],
+    priority: int = 100,
+    max_attempts: int = 3,
+) -> str:
+    _ = db_url
+    job_id = str(uuid4())
+    async with get_pool().acquire() as conn:
+        own = await conn.fetchrow(
+            """
+            SELECT 1 AS ok FROM public.threads
+            WHERE id = $1::uuid AND user_id = $2::uuid
+            """,
+            thread_id,
+            user_internal_id,
+        )
+        if own is None:
+            raise ThreadAccessError("Thread not found or access denied")
+        await conn.execute(
+            """
+            INSERT INTO public.agent_jobs (
+                id,
+                thread_id,
+                user_id,
+                job_type,
+                payload,
+                status,
+                priority,
+                attempts,
+                max_attempts,
+                available_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1::uuid,
+                $2::uuid,
+                $3::uuid,
+                $4,
+                $5::jsonb,
+                'queued',
+                $6,
+                0,
+                $7,
+                NOW(),
+                NOW(),
+                NOW()
+            )
+            """,
+            job_id,
+            thread_id,
+            user_internal_id,
+            job_type,
+            json.dumps(payload),
+            priority,
+            max_attempts,
+        )
+    return job_id
+
+
+async def claim_next_agent_job(db_url: str, worker_id: str) -> Optional[dict[str, Any]]:
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH next_job AS (
+                SELECT id
+                FROM public.agent_jobs
+                WHERE status = 'queued' AND available_at <= NOW()
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE public.agent_jobs AS j
+            SET
+                status = 'running',
+                worker_id = $1,
+                attempts = j.attempts + 1,
+                started_at = COALESCE(j.started_at, NOW()),
+                heartbeat_at = NOW(),
+                updated_at = NOW(),
+                last_error = NULL
+            FROM next_job
+            WHERE j.id = next_job.id
+            RETURNING
+                j.id::text AS id,
+                j.thread_id::text AS thread_id,
+                j.user_id::text AS user_id,
+                j.job_type,
+                j.payload,
+                j.status,
+                j.priority,
+                j.attempts,
+                j.max_attempts,
+                j.available_at,
+                j.worker_id,
+                j.heartbeat_at,
+                j.started_at,
+                j.completed_at,
+                j.last_error,
+                j.created_at,
+                j.updated_at
+            """,
+            worker_id,
+        )
+
+    if row is None:
+        return None
+    return dict(row)
+
+
+async def touch_agent_job(db_url: str, job_id: str, worker_id: str) -> None:
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        res = await conn.execute(
+            """
+            UPDATE public.agent_jobs
+            SET heartbeat_at = NOW(), updated_at = NOW()
+            WHERE id = $1::uuid AND worker_id = $2 AND status = 'running'
+            """,
+            job_id,
+            worker_id,
+        )
+    if res == "UPDATE 0":
+        raise AgentJobNotFoundError(f"Agent job {job_id} is not running for worker {worker_id}.")
+
+
+async def complete_agent_job(db_url: str, job_id: str) -> None:
+    _ = db_url
+    async with get_pool().acquire() as conn:
+        res = await conn.execute(
+            """
+            UPDATE public.agent_jobs
+            SET
+                status = 'completed',
+                completed_at = NOW(),
+                heartbeat_at = NOW(),
+                updated_at = NOW(),
+                last_error = NULL
+            WHERE id = $1::uuid
+            """,
+            job_id,
+        )
+    if res == "UPDATE 0":
+        raise AgentJobNotFoundError(f"Agent job {job_id} was not found.")
+
+
+async def fail_agent_job(
+    db_url: str,
+    job_id: str,
+    *,
+    error: str,
+    retry_delay_seconds: Optional[int] = None,
+) -> dict[str, Any]:
+    _ = db_url
+    retry_seconds = retry_delay_seconds if retry_delay_seconds is not None else _job_retry_delay_seconds()
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT attempts, max_attempts
+            FROM public.agent_jobs
+            WHERE id = $1::uuid
+            """,
+            job_id,
+        )
+        if row is None:
+            raise AgentJobNotFoundError(f"Agent job {job_id} was not found.")
+
+        attempts = int(row["attempts"])
+        max_attempts = int(row["max_attempts"])
+        terminal = attempts >= max_attempts
+        if terminal:
+            await conn.execute(
+                """
+                UPDATE public.agent_jobs
+                SET
+                    status = 'failed',
+                    completed_at = NOW(),
+                    heartbeat_at = NOW(),
+                    updated_at = NOW(),
+                    last_error = $2
+                WHERE id = $1::uuid
+                """,
+                job_id,
+                error,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE public.agent_jobs
+                SET
+                    status = 'queued',
+                    worker_id = NULL,
+                    available_at = NOW() + ($2::int * INTERVAL '1 second'),
+                    heartbeat_at = NULL,
+                    updated_at = NOW(),
+                    last_error = $3
+                WHERE id = $1::uuid
+                """,
+                job_id,
+                retry_seconds,
+                error,
+            )
+
+    return {
+        "terminal": terminal,
+        "attempts": attempts,
+        "max_attempts": max_attempts,
+        "retry_delay_seconds": retry_seconds,
+    }
+
+
+async def recover_stale_agent_jobs(db_url: str) -> dict[str, Any]:
+    _ = db_url
+    stale_seconds = _job_stale_threshold_seconds()
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE public.agent_jobs
+            SET
+                status = CASE
+                    WHEN attempts >= max_attempts THEN 'failed'
+                    ELSE 'queued'
+                END,
+                worker_id = NULL,
+                available_at = CASE
+                    WHEN attempts >= max_attempts THEN available_at
+                    ELSE NOW()
+                END,
+                heartbeat_at = NULL,
+                completed_at = CASE
+                    WHEN attempts >= max_attempts THEN NOW()
+                    ELSE completed_at
+                END,
+                updated_at = NOW(),
+                last_error = COALESCE(
+                    last_error,
+                    'Recovered stale running job after worker heartbeat expired.'
+                )
+            WHERE status = 'running'
+              AND COALESCE(heartbeat_at, started_at, updated_at) < NOW() - ($1::int * INTERVAL '1 second')
+            RETURNING
+                id::text AS id,
+                thread_id::text AS thread_id,
+                user_id::text AS user_id,
+                job_type,
+                payload,
+                status,
+                attempts,
+                max_attempts,
+                last_error
+            """,
+            stale_seconds,
+        )
+
+    recovered = 0
+    failed = 0
+    terminal_jobs: list[dict[str, Any]] = []
+    for row in rows:
+        if row["status"] == "failed":
+            failed += 1
+            terminal_jobs.append(dict(row))
+        else:
+            recovered += 1
+    return {"recovered": recovered, "failed": failed, "terminal_jobs": terminal_jobs}
 
 
 async def get_thread_state(
