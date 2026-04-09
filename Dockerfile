@@ -23,4 +23,4 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirement
 COPY . .
 
 # Run the pre-installed binary directly — no npx download on startup
-CMD ["openclaw", "gateway", "--bind", "lan", "--force"]
+CMD ["openclaw", "gateway", "--bind", "lan"]
