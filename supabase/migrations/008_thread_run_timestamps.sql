@@ -1,5 +1,0 @@
-ALTER TABLE public.thread_runs
-ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
-
-ALTER TABLE public.thread_runs
-ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;

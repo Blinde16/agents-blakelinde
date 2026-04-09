@@ -1,0 +1,79 @@
+services:
+  - type: web
+    name: openclaw-gateway
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: npx openclaw gateway
+    healthCheckPath: /health
+    envVars:
+      # Core
+      - key: DATABASE_URL
+        fromDatabase:
+          name: openclaw-postgres
+          property: connectionString
+      - key: INTERNAL_SERVICE_KEY_SIGNER
+        sync: false
+      - key: SECRETS_FERNET_KEY
+        sync: false
+
+      # LLM
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_ROUTER_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: ROUTER_USE_LLM
+        value: "1"
+
+      # Runtime
+      - key: LOG_LEVEL
+        value: INFO
+      - key: THREAD_RUN_STALE_SECONDS
+        value: "480"
+      - key: PG_POOL_MIN
+        value: "1"
+      - key: PG_POOL_MAX
+        value: "10"
+      - key: PG_POOL_COMMAND_TIMEOUT
+        value: "120"
+      - key: TOOL_SYNC_TIMEOUT
+        value: "120"
+
+      # Integrations (set manually in Render dashboard)
+      - key: HUBSPOT_PRIVATE_APP_TOKEN
+        sync: false
+      - key: NOTION_API_KEY
+        sync: false
+      - key: NOTION_CONTENT_CALENDAR_DB_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_PRIMARY_CALENDAR_ID
+        value: primary
+
+      # Slack
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_APP_TOKEN
+        sync: false
+
+      # Production safety guards — always off in prod
+      - key: ALLOW_INSECURE_DEV_AUTH
+        value: "0"
+      - key: ALLOW_PLAINTEXT_INTEGRATION_SECRETS
+        value: "0"
+
+databases:
+  - name: openclaw-postgres
+    plan: starter
+    region: oregon
+    databaseName: openclaw
+    user: openclaw
