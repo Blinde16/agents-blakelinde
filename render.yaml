@@ -1,13 +1,12 @@
 services:
-  - type: web
+  - type: worker
     name: openclaw-gateway
     runtime: node
     plan: starter
     region: oregon
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: npx openclaw gateway
-    healthCheckPath: /health
+    startCommand: npx openclaw gateway --bind lan --force
     envVars:
       # Core
       - key: DATABASE_URL
