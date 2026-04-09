@@ -22,5 +22,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirement
 # Copy repo
 COPY . .
 
-# Run the pre-installed binary directly — no npx download on startup
-CMD ["openclaw", "gateway", "--bind", "lan"]
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
+
+# Bootstrap config + Slack channel, then start gateway
+ENTRYPOINT ["./entrypoint.sh"]
