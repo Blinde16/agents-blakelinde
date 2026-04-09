@@ -10,16 +10,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# Pre-install openclaw globally at build time — avoids 4-min runtime download
+RUN npm install -g openclaw
+
 # Copy dependency files first (layer cache)
 COPY requirements.txt ./
 
 # Install Python skill dependencies
 RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-# Copy the rest of the repo
+# Copy repo
 COPY . .
 
-# openclaw is invoked via npx — no npm install needed
-# Expose nothing: this is a WebSocket worker, not an HTTP server
-
-CMD ["npx", "--yes", "openclaw", "gateway", "--bind", "lan", "--force"]
+# Run the pre-installed binary directly — no npx download on startup
+CMD ["openclaw", "gateway", "--bind", "lan", "--force"]
