@@ -24,6 +24,6 @@ if ! grep -q "SLACK_BOT_TOKEN=" .env || ! grep -q "SLACK_APP_TOKEN=" .env; then
 fi
 
 # 3. Fire up OpenClaw
-echo "=> Starting OpenClaw Daemon..."
-npx openclaw@latest start --daemon
-echo "=> OpenClaw is now running in the background! Logs are available via 'npx openclaw logs'."
+echo "=> Starting OpenClaw Gateway Server..."
+npx openclaw gateway
+echo "=> OpenClaw is running!"
